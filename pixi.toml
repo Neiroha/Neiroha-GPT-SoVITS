@@ -40,7 +40,10 @@ install-assets-hf-mirror = { cmd = "python scripts/download_gpt_sovits_assets.py
 install-v2pro-hf = { cmd = "python scripts/download_gpt_sovits_assets.py --source hf --v2pro-plus --skip-base-assets" }
 install-genshin-demo-hf = { cmd = "python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --genshin-demo --activate-voices" }
 api = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 9880" }
+api-12080 = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 12080" }
 api-preload = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 9880 --preload-model" }
 admin = { cmd = "python scripts/launch_gpt_sovits.py --mode admin --port 7860 --api-base http://127.0.0.1:9880" }
-webui = { cmd = "python scripts/launch_gpt_sovits.py --mode admin --port 7860 --api-base http://127.0.0.1:9880" }
+webui = { cmd = "python scripts/serve_neiroha_gpt_sovits.py --api-port 9880 --admin-port 7860" }
+webui-12080 = { cmd = "python scripts/serve_neiroha_gpt_sovits.py --api-port 12080 --admin-port 7860" }
+webui-preload = { cmd = "python scripts/serve_neiroha_gpt_sovits.py --api-port 9880 --admin-port 7860 --preload-model" }
 launcher-help = { cmd = "python scripts/launch_gpt_sovits.py --help" }

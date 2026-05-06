@@ -89,16 +89,37 @@ FastAPI 主服务，默认端口 `9880`：
 pixi run api
 ```
 
-Gradio 管理页，默认端口 `7860`，通过 HTTP 管理 `9880` 上的 FastAPI：
+Gradio 管理页，默认端口 `7860`，通过 HTTP 管理已经运行在 `9880` 上的 FastAPI：
 
 ```powershell
 pixi run admin
+```
+
+一键启动完整本地栈：FastAPI API 在 `9880`，Gradio 管理页在 `7860`：
+
+```powershell
+pixi run webui
+```
+
+如果 Windows 把 `9880` 放进了 TCP excluded port range，`9880` 不会显示为被进程占用，
+但依然无法绑定。这种情况下可以先用备用端口启动：
+
+```powershell
+pixi run webui-12080
+```
+
+然后把 Neiroha 里的 Base URL 临时改成 `http://127.0.0.1:12080`。也可以用环境变量覆盖：
+
+```powershell
+$env:NEIROHA_GPT_SOVITS_API_PORT = "12080"
+pixi run python scripts/serve_neiroha_gpt_sovits.py
 ```
 
 启动时预加载模型：
 
 ```powershell
 pixi run api-preload
+pixi run webui-preload
 ```
 
 ## Neiroha 配置
