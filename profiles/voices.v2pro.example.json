@@ -9,8 +9,8 @@
       "prompt_lang": "zh",
       "text_lang": "zh",
       "aux_ref_audio_paths": [],
-      "gpt_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
-      "sovits_weights_path": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
+      "gpt_weights_path": "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/s1v3.ckpt",
+      "sovits_weights_path": "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
     },
     {
       "id": "speaker-b",
@@ -21,8 +21,8 @@
       "prompt_lang": "zh",
       "text_lang": "zh",
       "aux_ref_audio_paths": [],
-      "gpt_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
-      "sovits_weights_path": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
+      "gpt_weights_path": "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/s1v3.ckpt",
+      "sovits_weights_path": "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
     }
   ]
 }

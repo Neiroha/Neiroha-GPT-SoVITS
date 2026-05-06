@@ -43,6 +43,9 @@ pixi run install-deps
 pixi run install-assets
 ```
 
+预训练基座、官方权重和下载好的角色模型都会放在顶层 `models/` 下。
+`runtime/` 只保留运行时缓存、上传临时文件和生成语音输出。
+
 下载 Hugging Face 上的官方 v2ProPlus 测试权重：
 
 ```powershell
@@ -83,19 +86,23 @@ Copy-Item profiles/voices.example.json profiles/voices.json
 
 ## Run
 
-FastAPI 主服务，默认端口 `9880`：
+FastAPI 主服务，默认端口 `9880`。纯 API 启动时可以用 `--default-voice`
+选择默认 voice；OpenAI 风格说话人列表始终可从 `/v1/audio/voices` 查看：
 
 ```powershell
 pixi run api
+pixi run python scripts/launch_gpt_sovits.py --mode api --port 12080 --default-voice genshin-paimon --preload-model
 ```
 
-Gradio 管理页，默认端口 `7860`，通过 HTTP 管理已经运行在 `9880` 上的 FastAPI：
+Gradio 管理控制台，默认端口 `7860`。它是额外的网页管理界面：可以连接已经运行的
+FastAPI，也可以在网页里启动/停止一个由它管理的 FastAPI 进程：
 
 ```powershell
 pixi run admin
 ```
 
-一键启动完整本地栈：FastAPI API 在 `9880`，Gradio 管理页在 `7860`：
+日常一键 WebUI 会先打开同一个 admin 控制台，并自动拉起 FastAPI。FastAPI API 在
+`9880`，Gradio 管理页在 `7860`：
 
 ```powershell
 pixi run webui
@@ -108,11 +115,11 @@ pixi run webui
 pixi run webui-12080
 ```
 
-然后把 Neiroha 里的 Base URL 临时改成 `http://127.0.0.1:12080`。也可以用环境变量覆盖：
+然后把 Neiroha 里的 Base URL 临时改成 `http://127.0.0.1:12080`。也可以直接开
+`12080` 的 admin 控制台：
 
 ```powershell
-$env:NEIROHA_GPT_SOVITS_API_PORT = "12080"
-pixi run python scripts/serve_neiroha_gpt_sovits.py
+pixi run admin-12080
 ```
 
 启动时预加载模型：

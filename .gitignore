@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 runtime/
+models/
 logs/
 outputs/
 *.wav

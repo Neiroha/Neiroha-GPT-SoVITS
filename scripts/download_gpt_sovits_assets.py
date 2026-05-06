@@ -12,8 +12,12 @@ from pathlib import Path
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 REPO_DIR = WORKSPACE_ROOT / "GPT-SoVITS"
-DOWNLOAD_DIR = WORKSPACE_ROOT / "runtime" / "downloads"
-PRETRAINED_DIR = REPO_DIR / "GPT_SoVITS" / "pretrained_models"
+MODELS_ROOT = WORKSPACE_ROOT / "models"
+DOWNLOAD_DIR = MODELS_ROOT / "downloads"
+PRETRAINED_PACKAGE_DIR = MODELS_ROOT / "pretrained" / "GPT-SoVITS" / "GPT_SoVITS"
+PRETRAINED_DIR = PRETRAINED_PACKAGE_DIR / "pretrained_models"
+COMPAT_PRETRAINED_DIR = REPO_DIR / "GPT_SoVITS" / "pretrained_models"
+COMPAT_G2PW_DIR = REPO_DIR / "GPT_SoVITS" / "text" / "G2PWModel"
 ACTIVE_PROFILE_PATH = WORKSPACE_ROOT / "profiles" / "voices.json"
 GENSHIN_PROFILE_EXAMPLE_PATH = WORKSPACE_ROOT / "profiles" / "voices.genshin.example.json"
 
@@ -54,7 +58,7 @@ V2PRO_PLUS_FILES = {
 
 GENSHIN_REPO_ID = "UnlimitedBurst/GPT-SoVITS"
 GENSHIN_ROOT = "原神（已更新4.8）"
-GENSHIN_MODEL_DIR = WORKSPACE_ROOT / "runtime" / "models" / "hf" / "UnlimitedBurst__GPT-SoVITS" / GENSHIN_ROOT
+GENSHIN_MODEL_DIR = MODELS_ROOT / "voices" / "hf" / "UnlimitedBurst__GPT-SoVITS" / GENSHIN_ROOT
 GENSHIN_DEFAULT_SPEAKERS = ["派蒙", "刻晴", "可莉"]
 GENSHIN_VOICE_IDS = {
     "派蒙": "genshin-paimon",
@@ -65,14 +69,14 @@ GENSHIN_VOICE_IDS = {
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download GPT-SoVITS pretrained assets into the submodule."
+        description="Download GPT-SoVITS model assets into the top-level models directory."
     )
     parser.add_argument("--source", choices=sorted(SOURCES), default="modelscope")
     parser.add_argument("--download-uvr5", action="store_true")
     parser.add_argument(
         "--v2pro-plus",
         action="store_true",
-        help="Download official v2ProPlus weights from Hugging Face into GPT_SoVITS/pretrained_models.",
+        help="Download official v2ProPlus weights from Hugging Face into models/pretrained.",
     )
     parser.add_argument(
         "--skip-base-assets",
@@ -203,6 +207,15 @@ def extract_tar(tar_path: Path, target_dir: Path) -> None:
         archive.extractall(target_dir)
 
 
+def sync_compat_tree(source: Path, target: Path) -> None:
+    if not source.exists():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(source, target)
+
+
 def maybe_download_pretrained(urls: dict[str, str], *, force: bool) -> None:
     markers = [
         PRETRAINED_DIR / "chinese-roberta-wwm-ext-large",
@@ -210,18 +223,24 @@ def maybe_download_pretrained(urls: dict[str, str], *, force: bool) -> None:
     ]
     if all(marker.exists() for marker in markers) and not force:
         print("Pretrained models already look present; skipping.")
+        if not COMPAT_PRETRAINED_DIR.exists():
+            sync_compat_tree(PRETRAINED_DIR, COMPAT_PRETRAINED_DIR)
         return
     archive = download(urls["pretrained"], DOWNLOAD_DIR / "pretrained_models.zip", force=force)
-    extract_zip(archive, REPO_DIR / "GPT_SoVITS")
+    extract_zip(archive, PRETRAINED_PACKAGE_DIR)
+    sync_compat_tree(PRETRAINED_DIR, COMPAT_PRETRAINED_DIR)
 
 
 def maybe_download_g2pw(urls: dict[str, str], *, force: bool) -> None:
-    marker = REPO_DIR / "GPT_SoVITS" / "text" / "G2PWModel"
+    marker = PRETRAINED_PACKAGE_DIR / "text" / "G2PWModel"
     if marker.exists() and not force:
         print("G2PWModel already present; skipping.")
+        if not COMPAT_G2PW_DIR.exists():
+            sync_compat_tree(marker, COMPAT_G2PW_DIR)
         return
     archive = download(urls["g2pw"], DOWNLOAD_DIR / "G2PWModel.zip", force=force)
-    extract_zip(archive, REPO_DIR / "GPT_SoVITS" / "text")
+    extract_zip(archive, PRETRAINED_PACKAGE_DIR / "text")
+    sync_compat_tree(PRETRAINED_PACKAGE_DIR / "text" / "G2PWModel", COMPAT_G2PW_DIR)
 
 
 def maybe_download_nltk(urls: dict[str, str], *, force: bool) -> None:
@@ -250,18 +269,21 @@ def maybe_download_open_jtalk(urls: dict[str, str], *, force: bool) -> None:
 
 
 def maybe_download_uvr5(urls: dict[str, str], *, force: bool) -> None:
-    marker = REPO_DIR / "tools" / "uvr5" / "uvr5_weights"
+    marker = MODELS_ROOT / "tools" / "uvr5" / "uvr5_weights"
     if marker.exists() and not force:
         print("UVR5 weights already present; skipping.")
         return
     archive = download(urls["uvr5"], DOWNLOAD_DIR / "uvr5_weights.zip", force=force)
-    extract_zip(archive, REPO_DIR / "tools" / "uvr5")
+    extract_zip(archive, MODELS_ROOT / "tools" / "uvr5")
 
 
 def maybe_download_v2pro_plus(*, force: bool) -> None:
     print("Downloading GPT-SoVITS v2ProPlus weights from Hugging Face.")
     for repo_path, target in V2PRO_PLUS_FILES.items():
         download_huggingface_file("lj1995/GPT-SoVITS", repo_path, target, force=force)
+        compat_target = COMPAT_PRETRAINED_DIR / repo_path
+        compat_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(target, compat_target)
     print("")
     print("v2ProPlus local paths")
     print(f"GPT weights : {PRETRAINED_DIR / 's1v3.ckpt'}")

@@ -1,7 +1,9 @@
 # API Reference
 
 FastAPI is the real runtime API and defaults to `http://127.0.0.1:9880`.
-The Gradio admin panel is a separate client on `http://127.0.0.1:7860`.
+The Gradio admin panel is a separate management UI on `http://127.0.0.1:7860`.
+It can connect to an existing FastAPI process or start/stop a managed one from
+the browser.
 
 ## Health
 
@@ -43,6 +45,10 @@ For the bundled Hugging Face Genshin demo downloader, the default voice ids are
 `genshin-paimon`, `genshin-keqing`, and `genshin-klee`. The generated
 `profiles/voices.json` points each voice at its own GPT checkpoint, SoVITS
 checkpoint, reference wav, and prompt text.
+
+Every non-streaming synthesis writes a copy under `runtime/outputs/` using
+`speaker_YYYYMMDDHHMMSS.ext` naming and returns that path in the
+`X-Neiroha-Output-Path` response header.
 
 ## Native GPT-SoVITS
 

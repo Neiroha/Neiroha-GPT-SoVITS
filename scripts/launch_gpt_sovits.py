@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime as dt
 import gc
 import io
 import json
 import logging
 import os
+import re
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,13 +34,18 @@ from pydantic import BaseModel, Field
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPO_DIR = WORKSPACE_ROOT / "GPT-SoVITS"
-DEFAULT_CONFIG_PATH = DEFAULT_REPO_DIR / "GPT_SoVITS" / "configs" / "tts_infer.yaml"
+CONFIG_TEMPLATE_PATH = WORKSPACE_ROOT / "configs" / "tts_infer.yaml"
 DEFAULT_PROFILE_PATH = WORKSPACE_ROOT / "profiles" / "voices.json"
+MODELS_ROOT = WORKSPACE_ROOT / "models"
+PRETRAINED_MODELS_DIR = MODELS_ROOT / "pretrained" / "GPT-SoVITS" / "GPT_SoVITS" / "pretrained_models"
 RUNTIME_ROOT = WORKSPACE_ROOT / "runtime"
+RUNTIME_CACHE_ROOT = RUNTIME_ROOT / "cache"
 TEMP_ROOT = RUNTIME_ROOT / "temp"
 UPLOAD_ROOT = TEMP_ROOT / "uploads"
+OUTPUT_ROOT = RUNTIME_ROOT / "outputs"
+DEFAULT_CONFIG_PATH = RUNTIME_CACHE_ROOT / "tts_infer.yaml"
 
-for path in (RUNTIME_ROOT, TEMP_ROOT, UPLOAD_ROOT):
+for path in (RUNTIME_ROOT, RUNTIME_CACHE_ROOT, TEMP_ROOT, UPLOAD_ROOT, OUTPUT_ROOT):
     path.mkdir(parents=True, exist_ok=True)
 
 os.environ.setdefault("TMPDIR", str(TEMP_ROOT))
@@ -151,6 +163,44 @@ def require_supported_format(response_format: str) -> str:
             f"response_format must be one of: {', '.join(sorted(SUPPORTED_OPENAI_FORMATS))}"
         )
     return fmt
+
+
+def safe_filename_part(value: Any, fallback: str = "speech") -> str:
+    text = strip_text(value) or fallback
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", text)
+    text = re.sub(r"\s+", "_", text).strip("._ ")
+    return text or fallback
+
+
+def write_runtime_output(content: bytes, speaker: Any, response_format: str) -> Path:
+    fmt = require_supported_format(response_format)
+    suffix = "raw" if fmt in {"pcm", "raw"} else fmt
+    timestamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
+    speaker_name = safe_filename_part(speaker)
+    path = OUTPUT_ROOT / f"{speaker_name}_{timestamp}.{suffix}"
+    counter = 1
+    while path.exists():
+        path = OUTPUT_ROOT / f"{speaker_name}_{timestamp}_{counter}.{suffix}"
+        counter += 1
+    path.write_bytes(content)
+    return path
+
+
+def ensure_default_config(config_path: Path) -> Path:
+    config_path = config_path.resolve()
+    if config_path.exists():
+        return config_path
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    if CONFIG_TEMPLATE_PATH.exists():
+        shutil.copyfile(CONFIG_TEMPLATE_PATH, config_path)
+    else:
+        fallback = DEFAULT_REPO_DIR / "GPT_SoVITS" / "configs" / "tts_infer.yaml"
+        if fallback.exists():
+            shutil.copyfile(fallback, config_path)
+        else:
+            raise FileNotFoundError(f"Default TTS config template is missing: {CONFIG_TEMPLATE_PATH}")
+    return config_path
 
 
 def audio_to_int16(data: np.ndarray) -> np.ndarray:
@@ -289,7 +339,7 @@ class VoiceRegistry:
     def _read_payload(self) -> list[dict[str, Any]]:
         if not self.profile_path.exists():
             return []
-        data = json.loads(self.profile_path.read_text(encoding="utf-8"))
+        data = json.loads(self.profile_path.read_text(encoding="utf-8-sig"))
         if isinstance(data, dict):
             data = data.get("voices", [])
         if not isinstance(data, list):
@@ -436,6 +486,7 @@ class GPTSoVITSRuntime:
         from GPT_SoVITS.TTS_infer_pack.TTS import TTS_Config
 
         selected_config = resolve_optional_path(config_path, repo_dir=self.repo_dir) or str(self.config_path)
+        selected_config = str(ensure_default_config(Path(selected_config)))
         tts_config = TTS_Config(selected_config)
 
         if self.device_override and self.device_override != "config":
@@ -709,9 +760,12 @@ def request_with_profile(
     *,
     runtime: GPTSoVITSRuntime,
     registry: VoiceRegistry,
+    default_voice_id: str = "",
 ) -> tuple[dict[str, Any], Optional[VoiceProfile]]:
     data = model_dump(payload)
     voice_id = extract_voice_id(data.get("voice"))
+    if voice_id in {"", "default"} and strip_text(default_voice_id):
+        voice_id = strip_text(default_voice_id)
     profile = registry.get(voice_id)
     if profile is None and voice_id in {"", "default"}:
         profile = registry.first()
@@ -768,12 +822,23 @@ def request_with_profile(
     return request, profile
 
 
-def audio_response(sample_rate: int, audio_data: np.ndarray, response_format: str) -> Response:
+def audio_response(
+    sample_rate: int,
+    audio_data: np.ndarray,
+    response_format: str,
+    *,
+    speaker: Any = "",
+) -> Response:
     fmt = require_supported_format(response_format)
+    content = pack_audio(audio_data, sample_rate, fmt)
+    output_path = write_runtime_output(content, speaker or "speech", fmt)
     return Response(
-        content=pack_audio(audio_data, sample_rate, fmt),
+        content=content,
         media_type=CONTENT_TYPES[fmt],
-        headers={"Content-Disposition": f'inline; filename="speech.{fmt if fmt != "pcm" else "raw"}"'},
+        headers={
+            "Content-Disposition": f'inline; filename="{output_path.name}"',
+            "X-Neiroha-Output-Path": str(output_path),
+        },
     )
 
 
@@ -815,7 +880,12 @@ def cleanup_temp_files(paths: Iterable[Optional[str]]) -> None:
             Path(path).unlink(missing_ok=True)
 
 
-def create_api_app(runtime: GPTSoVITSRuntime, registry: VoiceRegistry) -> FastAPI:
+def create_api_app(
+    runtime: GPTSoVITSRuntime,
+    registry: VoiceRegistry,
+    *,
+    default_voice_id: str = "",
+) -> FastAPI:
     app = FastAPI(
         title="Neiroha GPT-SoVITS Launcher",
         version="0.1.0",
@@ -842,7 +912,11 @@ def create_api_app(runtime: GPTSoVITSRuntime, registry: VoiceRegistry) -> FastAP
     @app.get("/health")
     @app.get("/api/health", include_in_schema=False)
     def health():
-        return {"status": "ok", **runtime.status()}
+        return {
+            "status": "ok",
+            "default_voice": strip_text(default_voice_id) or "default",
+            **runtime.status(),
+        }
 
     @app.get("/v1/models")
     def list_models():
@@ -888,6 +962,7 @@ def create_api_app(runtime: GPTSoVITSRuntime, registry: VoiceRegistry) -> FastAP
         return {
             **runtime.status(),
             "profiles_path": str(registry.profile_path),
+            "default_voice": strip_text(default_voice_id) or "default",
             "voices": [profile.to_openai_voice() for profile in registry.list_profiles()],
             "routes": {
                 "native_tts": "/tts",
@@ -912,10 +987,16 @@ def create_api_app(runtime: GPTSoVITSRuntime, registry: VoiceRegistry) -> FastAP
             return openai_error("Only stream_format='audio' is supported by this local launcher.")
 
         try:
-            request, profile = request_with_profile(payload, runtime=runtime, registry=registry)
+            request, profile = request_with_profile(
+                payload,
+                runtime=runtime,
+                registry=registry,
+                default_voice_id=default_voice_id,
+            )
             runtime.apply_profile_weights(profile)
             sample_rate, audio_data = runtime.synthesize_once(request)
-            return audio_response(sample_rate, audio_data, request["media_type"])
+            speaker = profile.id if profile else extract_voice_id(payload.voice) or default_voice_id or "default"
+            return audio_response(sample_rate, audio_data, request["media_type"], speaker=speaker)
         except FileNotFoundError as exc:
             return openai_error(str(exc), status_code=404)
         except (ValueError, RuntimeError) as exc:
@@ -993,7 +1074,7 @@ def create_api_app(runtime: GPTSoVITSRuntime, registry: VoiceRegistry) -> FastAP
                     response_format=normalized["media_type"],
                 )
             sample_rate, audio_data = runtime.synthesize_once(request)
-            return audio_response(sample_rate, audio_data, request["media_type"])
+            return audio_response(sample_rate, audio_data, request["media_type"], speaker="native")
         except FileNotFoundError as exc:
             return json_response({"message": str(exc)}, status_code=404)
         except (ValueError, RuntimeError) as exc:
@@ -1029,7 +1110,7 @@ def create_api_app(runtime: GPTSoVITSRuntime, registry: VoiceRegistry) -> FastAP
                 "batch_size": 1,
             }
             sample_rate, audio_data = runtime.synthesize_once(request)
-            return audio_response(sample_rate, audio_data, response_format)
+            return audio_response(sample_rate, audio_data, response_format, speaker="upload")
         finally:
             cleanup_temp_files([temp_ref])
 
@@ -1231,7 +1312,113 @@ def build_gradio_blocks(runtime: GPTSoVITSRuntime, registry: VoiceRegistry):
     return blocks.queue(max_size=8, default_concurrency_limit=1)
 
 
-def build_gradio_admin_blocks(api_base: str, registry: VoiceRegistry):
+class ManagedApiProcess:
+    def __init__(
+        self,
+        *,
+        api_host: str,
+        api_port: int,
+        repo_dir: Path,
+        config_path: Path,
+        profiles_path: Path,
+        device: str,
+        is_half: Optional[bool],
+        default_voice_id: str,
+        log_level: str,
+    ) -> None:
+        self.api_host = api_host
+        self.api_port = api_port
+        self.repo_dir = repo_dir
+        self.config_path = config_path
+        self.profiles_path = profiles_path
+        self.device = device
+        self.is_half = is_half
+        self.default_voice_id = default_voice_id
+        self.log_level = log_level
+        self.process: Optional[subprocess.Popen] = None
+
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def external_health_ok(self) -> bool:
+        health_url = f"http://127.0.0.1:{self.api_port}/health"
+        try:
+            with urllib.request.urlopen(health_url, timeout=2) as response:
+                return response.status == 200
+        except (OSError, urllib.error.URLError):
+            return False
+
+    def command(self, default_voice_id: str, preload_model: bool) -> list[str]:
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--mode",
+            "api",
+            "--repo-dir",
+            str(self.repo_dir),
+            "--config",
+            str(self.config_path),
+            "--profiles",
+            str(self.profiles_path),
+            "--host",
+            self.api_host,
+            "--port",
+            str(self.api_port),
+            "--device",
+            self.device,
+            "--log-level",
+            self.log_level,
+        ]
+        if default_voice_id:
+            command += ["--default-voice", default_voice_id]
+        if preload_model:
+            command.append("--preload-model")
+        if self.is_half is True:
+            command.append("--half")
+        elif self.is_half is False:
+            command.append("--no-half")
+        return command
+
+    def start(self, *, default_voice_id: str = "", preload_model: bool = False) -> str:
+        if self.is_running():
+            return f"Managed API is already running with PID {self.process.pid}."
+        if self.external_health_ok():
+            return f"FastAPI is already reachable on port {self.api_port}; using the external process."
+        selected_voice = strip_text(default_voice_id) or strip_text(self.default_voice_id)
+        command = self.command(selected_voice, preload_model)
+        self.process = subprocess.Popen(command, cwd=WORKSPACE_ROOT)
+        time.sleep(1)
+        if self.process.poll() is not None:
+            return f"API process exited immediately with code {self.process.returncode}."
+        voice_label = selected_voice or "default"
+        return f"Started API PID {self.process.pid} on port {self.api_port}, default voice={voice_label}."
+
+    def stop(self) -> str:
+        if not self.is_running():
+            return "Managed API is not running."
+        assert self.process is not None
+        pid = self.process.pid
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+        return f"Stopped API PID {pid}."
+
+    def status(self) -> str:
+        if self.is_running():
+            return f"Managed API PID {self.process.pid} is running on port {self.api_port}."
+        if self.process is None:
+            return "Managed API has not been started from this admin page."
+        return f"Managed API exited with code {self.process.returncode}."
+
+
+def build_gradio_admin_blocks(
+    api_base: str,
+    registry: VoiceRegistry,
+    *,
+    process_manager: Optional[ManagedApiProcess] = None,
+):
     import gradio as gr
     import requests
 
@@ -1246,6 +1433,24 @@ def build_gradio_admin_blocks(api_base: str, registry: VoiceRegistry):
             return json.dumps(response.json(), ensure_ascii=False, indent=2)
         except Exception as exc:
             return f"ERROR: {exc}"
+
+    def managed_status_text() -> str:
+        if process_manager is None:
+            return "This admin page is connected to an external FastAPI process."
+        return process_manager.status()
+
+    def start_api(default_voice: str, preload_model: bool) -> tuple[str, str]:
+        if process_manager is None:
+            return "No managed API process is configured for this admin page.", status_text()
+        result = process_manager.start(default_voice_id=default_voice, preload_model=preload_model)
+        time.sleep(1)
+        return result, status_text()
+
+    def stop_api() -> tuple[str, str]:
+        if process_manager is None:
+            return "No managed API process is configured for this admin page.", status_text()
+        result = process_manager.stop()
+        return result, status_text()
 
     def load_model(config_path: str, gpt_weights_path: str, sovits_weights_path: str) -> str:
         payload = {
@@ -1309,7 +1514,13 @@ def build_gradio_admin_blocks(api_base: str, registry: VoiceRegistry):
             response.raise_for_status()
             return json.dumps(response.json(), ensure_ascii=False, indent=2)
         except Exception as exc:
-            return f"ERROR: {exc}"
+            payload = {
+                "object": "list",
+                "source": "local_profiles",
+                "api_error": str(exc),
+                "data": [profile.to_openai_voice() for profile in registry.list_profiles()],
+            }
+            return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def synthesize_preview(
         text: str,
@@ -1348,9 +1559,8 @@ def build_gradio_admin_blocks(api_base: str, registry: VoiceRegistry):
             response = requests.post(api_url("/v1/audio/speech"), json=payload, timeout=300)
 
         response.raise_for_status()
-        output_path = tempfile.NamedTemporaryFile(delete=False, dir=TEMP_ROOT, suffix=".wav").name
-        Path(output_path).write_bytes(response.content)
-        return output_path
+        output_path = write_runtime_output(response.content, voice or "preview", "wav")
+        return str(output_path)
 
     with gr.Blocks(title="Neiroha GPT-SoVITS Admin") as blocks:
         gr.Markdown("# Neiroha GPT-SoVITS Admin")
@@ -1362,23 +1572,32 @@ def build_gradio_admin_blocks(api_base: str, registry: VoiceRegistry):
                 unload_btn = gr.Button("Unload model")
             refresh_btn.click(status_text, outputs=status_box)
             unload_btn.click(unload_model, outputs=status_box)
+        with gr.Tab("API Process"):
+            process_box = gr.Textbox(value=managed_status_text, label="Managed FastAPI process")
+            process_voice = gr.Dropdown(choices=voice_choices(), value=voice_choices()[0], label="Default voice")
+            preload_checkbox = gr.Checkbox(value=False, label="Preload selected voice on API start")
+            with gr.Row():
+                start_api_btn = gr.Button("Start FastAPI")
+                stop_api_btn = gr.Button("Stop FastAPI")
+                process_refresh_btn = gr.Button("Refresh")
+            start_api_btn.click(
+                start_api,
+                inputs=[process_voice, preload_checkbox],
+                outputs=[process_box, status_box],
+            )
+            stop_api_btn.click(stop_api, outputs=[process_box, status_box])
+            process_refresh_btn.click(managed_status_text, outputs=process_box)
         with gr.Tab("Load / Weights"):
             config_input = gr.Textbox(
                 value=str(DEFAULT_CONFIG_PATH),
                 label="TTS config path",
             )
             gpt_input = gr.Textbox(
-                value=str(DEFAULT_REPO_DIR / "GPT_SoVITS" / "pretrained_models" / "s1v3.ckpt"),
+                value=str(PRETRAINED_MODELS_DIR / "s1v3.ckpt"),
                 label="GPT weights path",
             )
             sovits_input = gr.Textbox(
-                value=str(
-                    DEFAULT_REPO_DIR
-                    / "GPT_SoVITS"
-                    / "pretrained_models"
-                    / "v2Pro"
-                    / "s2Gv2ProPlus.pth"
-                ),
+                value=str(PRETRAINED_MODELS_DIR / "v2Pro" / "s2Gv2ProPlus.pth"),
                 label="SoVITS weights path",
             )
             with gr.Row():
@@ -1434,7 +1653,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--half", action="store_true", help="Force half precision.")
     parser.add_argument("--no-half", action="store_true", help="Force full precision.")
     parser.add_argument("--preload-model", action="store_true")
+    parser.add_argument("--default-voice", default=os.environ.get("NEIROHA_GPT_SOVITS_DEFAULT_VOICE", ""))
     parser.add_argument("--api-base", default="http://127.0.0.1:9880")
+    parser.add_argument("--api-host", default="0.0.0.0")
+    parser.add_argument("--api-port", type=int, default=None)
+    parser.add_argument("--auto-start-api", action="store_true")
     parser.add_argument("--gradio-path", default="/admin")
     parser.add_argument("--log-level", default="info")
     return parser.parse_args()
@@ -1454,6 +1677,15 @@ def resolve_port(mode: str, port: Optional[int]) -> int:
     return 7860 if mode in {"admin", "webui"} else 9880
 
 
+def resolve_api_port(api_base: str, explicit_port: Optional[int]) -> int:
+    if explicit_port is not None:
+        return explicit_port
+    parsed = urllib.parse.urlparse(api_base)
+    if parsed.port is not None:
+        return parsed.port
+    return 9880
+
+
 def main() -> None:
     configure_logging()
     args = parse_args()
@@ -1468,8 +1700,11 @@ def main() -> None:
     )
     registry = VoiceRegistry(args.profiles, repo_dir=args.repo_dir.resolve())
 
-    if args.preload_model:
+    if args.preload_model and args.mode not in {"admin", "webui"}:
         runtime.load()
+        default_profile = registry.get(args.default_voice)
+        if default_profile is not None:
+            runtime.apply_profile_weights(default_profile)
 
     LOGGER.info(
         "Starting Neiroha GPT-SoVITS mode=%s host=%s port=%s repo=%s config=%s",
@@ -1481,11 +1716,26 @@ def main() -> None:
     )
 
     if args.mode in {"admin", "webui"}:
-        blocks = build_gradio_admin_blocks(args.api_base, registry)
+        managed_api_port = resolve_api_port(args.api_base, args.api_port)
+        process_manager = ManagedApiProcess(
+            api_host=args.api_host,
+            api_port=managed_api_port,
+            repo_dir=args.repo_dir,
+            config_path=args.config,
+            profiles_path=args.profiles,
+            device=args.device,
+            is_half=is_half,
+            default_voice_id=args.default_voice,
+            log_level=args.log_level,
+        )
+        if args.auto_start_api or args.mode == "webui":
+            LOGGER.info("Auto-starting managed FastAPI on %s:%s", args.api_host, managed_api_port)
+            LOGGER.info(process_manager.start(default_voice_id=args.default_voice, preload_model=args.preload_model))
+        blocks = build_gradio_admin_blocks(args.api_base, registry, process_manager=process_manager)
         blocks.launch(server_name=args.host, server_port=port, show_error=True)
         return
 
-    app = create_api_app(runtime, registry)
+    app = create_api_app(runtime, registry, default_voice_id=args.default_voice)
     if args.mode == "combined":
         import gradio as gr
 
