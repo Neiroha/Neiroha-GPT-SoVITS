@@ -144,6 +144,30 @@ Neiroha 里已经有 `gptSovits` adapter：
 - Model: `gpt-sovits` 或保留 `tts-1`，本地服务会接受 `tts-1` 作为兼容别名
 - Voices: 从 `GET /v1/audio/voices` 读取 `profiles/voices.json`
 
+## Model Modes
+
+本仓库现在把 GPT-SoVITS 的两种常见用法分开：
+
+- 已训练音色：例如原神角色模型。`GET /gpt-sovits/models` 会按真实配置列出模型和里面的 voices，`/v1/audio/speech` 只走这些已配置 voice。
+- 声音克隆：使用 v2ProPlus 基座权重，加参考音频和对应文本。原生接口是 `POST /gpt-sovits/clone` 或上传版 `POST /gpt-sovits/clone/upload`。
+
+Gradio 管理页里也拆成了两个测试页：
+
+- `Trained Voice Test / 已训练音色测试`
+- `Clone Test / 声音克隆测试`
+
+非流式推理默认会在终端打印 RTF 性能日志：
+
+```text
+TTS performance mode=trained speaker=genshin-paimon audio=2.660s elapsed=22.844s rtf=8.588
+```
+
+关闭方式：
+
+```powershell
+pixi run python scripts/launch_gpt_sovits.py --mode api --port 12080 --no-rtf-log
+```
+
 ## API Examples
 
 OpenAI-compatible:

@@ -21,6 +21,10 @@ GET  /v1/audio/voices
 POST /v1/audio/speech
 ```
 
+`/v1/audio/speech` stays as the OpenAI-compatible speech surface. It uses saved
+trained voice profiles only; clone mode is exposed through native
+`/gpt-sovits/*` routes so Neiroha can model it as a separate capability.
+
 `POST /v1/audio/speech` accepts standard fields:
 
 - `model`: `gpt-sovits`, `tts-1`, or `tts-1-hd`
@@ -59,9 +63,26 @@ GET  /set_refer_audio
 GET  /set_gpt_weights
 GET  /set_sovits_weights
 GET  /control
+GET  /gpt-sovits/models
+GET  /gpt-sovits/voices
+POST /gpt-sovits/clone
+POST /gpt-sovits/clone/upload
 ```
 
 `POST /tts` follows the official `api_v2.py` shape and returns audio bytes.
+
+`/gpt-sovits/models` separates trained voice models from clone models. Trained
+models list their real configured voices from `profiles/voices.json`; clone
+models do not invent voices and require reference audio plus matching
+`prompt_text`.
+
+RTF logging is enabled by default for non-streaming synthesis:
+
+```text
+TTS performance mode=trained speaker=genshin-paimon audio=2.660s elapsed=22.844s rtf=8.588
+```
+
+Disable it with `--no-rtf-log` or `NEIROHA_GPT_SOVITS_RTF_LOG=0`.
 
 ## Management
 
