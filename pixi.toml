@@ -1,0 +1,42 @@
+[workspace]
+name = "neiroha-gpt-sovits"
+channels = ["conda-forge"]
+platforms = ["win-64"]
+requires-pixi = ">=0.61.0"
+
+[system-requirements]
+cuda = "12.8"
+
+[dependencies]
+python = "3.11.*"
+pip = "*"
+ffmpeg = "*"
+cmake = "*"
+
+[pypi-dependencies]
+fastapi = { version = ">=0.115.2,<1", extras = ["standard"] }
+uvicorn = { version = ">=0.32,<1", extras = ["standard"] }
+python-multipart = ">=0.0.20,<1"
+gradio = "<5"
+numpy = "<2.0"
+soundfile = ">=0.12,<1"
+pydantic = "<=2.10.6"
+requests = ">=2.32,<3"
+
+[target.win-64.pypi-dependencies]
+torch = { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.7.0%2Bcu128-cp311-cp311-win_amd64.whl" }
+torchaudio = { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchaudio-2.7.0%2Bcu128-cp311-cp311-win_amd64.whl" }
+torchvision = { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.22.0%2Bcu128-cp311-cp311-win_amd64.whl" }
+
+[tasks]
+submodule-init = { cmd = "git submodule update --init --recursive" }
+install-deps = { cmd = "python scripts/install_gpt_sovits_deps.py" }
+install-assets = { cmd = "python scripts/download_gpt_sovits_assets.py --source modelscope" }
+install-assets-hf = { cmd = "python scripts/download_gpt_sovits_assets.py --source hf" }
+install-assets-hf-mirror = { cmd = "python scripts/download_gpt_sovits_assets.py --source hf-mirror" }
+install-v2pro-hf = { cmd = "python scripts/download_gpt_sovits_assets.py --source hf --v2pro-plus --skip-base-assets" }
+api = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 9880" }
+api-preload = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 9880 --preload-model" }
+admin = { cmd = "python scripts/launch_gpt_sovits.py --mode admin --port 7860 --api-base http://127.0.0.1:9880" }
+webui = { cmd = "python scripts/launch_gpt_sovits.py --mode admin --port 7860 --api-base http://127.0.0.1:9880" }
+launcher-help = { cmd = "python scripts/launch_gpt_sovits.py --help" }

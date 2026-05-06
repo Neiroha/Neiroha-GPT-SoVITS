@@ -1,0 +1,16 @@
+{
+  "voices": [
+    {
+      "id": "default",
+      "name": "Default Reference",
+      "description": "Example voice profile. Copy this file to voices.json and point ref_audio_path to a real local audio file.",
+      "ref_audio_path": "D:/path/to/reference.wav",
+      "prompt_text": "Reference audio transcript goes here.",
+      "prompt_lang": "zh",
+      "text_lang": "zh",
+      "aux_ref_audio_paths": [],
+      "gpt_weights_path": "",
+      "sovits_weights_path": ""
+    }
+  ]
+}

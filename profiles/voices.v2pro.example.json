@@ -1,0 +1,28 @@
+{
+  "voices": [
+    {
+      "id": "speaker-a",
+      "name": "Speaker A",
+      "description": "v2ProPlus test speaker A. Point ref_audio_path to a real reference clip.",
+      "ref_audio_path": "D:/voices/speaker-a.wav",
+      "prompt_text": "Reference transcript for speaker A.",
+      "prompt_lang": "zh",
+      "text_lang": "zh",
+      "aux_ref_audio_paths": [],
+      "gpt_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+      "sovits_weights_path": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
+    },
+    {
+      "id": "speaker-b",
+      "name": "Speaker B",
+      "description": "v2ProPlus test speaker B. Use another reference clip to compare speakers.",
+      "ref_audio_path": "D:/voices/speaker-b.wav",
+      "prompt_text": "Reference transcript for speaker B.",
+      "prompt_lang": "zh",
+      "text_lang": "zh",
+      "aux_ref_audio_paths": [],
+      "gpt_weights_path": "GPT_SoVITS/pretrained_models/s1v3.ckpt",
+      "sovits_weights_path": "GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
+    }
+  ]
+}

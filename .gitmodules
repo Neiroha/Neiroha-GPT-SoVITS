@@ -1,0 +1,4 @@
+[submodule "GPT-SoVITS"]
+	path = GPT-SoVITS
+	url = https://github.com/RVC-Boss/GPT-SoVITS.git
+	ignore = dirty

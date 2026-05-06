@@ -1,0 +1,14 @@
+.pixi/
+.venv/
+__pycache__/
+*.pyc
+runtime/
+logs/
+outputs/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.aac
+*.pcm
+profiles/voices.json
