@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 import sys
 import tarfile
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -12,6 +14,8 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 REPO_DIR = WORKSPACE_ROOT / "GPT-SoVITS"
 DOWNLOAD_DIR = WORKSPACE_ROOT / "runtime" / "downloads"
 PRETRAINED_DIR = REPO_DIR / "GPT_SoVITS" / "pretrained_models"
+ACTIVE_PROFILE_PATH = WORKSPACE_ROOT / "profiles" / "voices.json"
+GENSHIN_PROFILE_EXAMPLE_PATH = WORKSPACE_ROOT / "profiles" / "voices.genshin.example.json"
 
 SOURCES = {
     "hf": {
@@ -48,6 +52,16 @@ V2PRO_PLUS_FILES = {
     / "pretrained_eres2netv2w24s4ep4.ckpt",
 }
 
+GENSHIN_REPO_ID = "UnlimitedBurst/GPT-SoVITS"
+GENSHIN_ROOT = "原神（已更新4.8）"
+GENSHIN_MODEL_DIR = WORKSPACE_ROOT / "runtime" / "models" / "hf" / "UnlimitedBurst__GPT-SoVITS" / GENSHIN_ROOT
+GENSHIN_DEFAULT_SPEAKERS = ["派蒙", "刻晴", "可莉"]
+GENSHIN_VOICE_IDS = {
+    "派蒙": "genshin-paimon",
+    "刻晴": "genshin-keqing",
+    "可莉": "genshin-klee",
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -64,6 +78,26 @@ def parse_args() -> argparse.Namespace:
         "--skip-base-assets",
         action="store_true",
         help="Skip the common pretrained/G2PW/NLTK/OpenJTalk asset downloads.",
+    )
+    parser.add_argument(
+        "--genshin-demo",
+        action="store_true",
+        help="Download a small ready-to-switch multi-speaker Genshin GPT-SoVITS demo set.",
+    )
+    parser.add_argument(
+        "--genshin-speakers",
+        default=",".join(GENSHIN_DEFAULT_SPEAKERS),
+        help="Comma-separated speaker names from UnlimitedBurst/GPT-SoVITS.",
+    )
+    parser.add_argument(
+        "--genshin-repo-id",
+        default=GENSHIN_REPO_ID,
+        help="Hugging Face repo id for the Genshin speaker models.",
+    )
+    parser.add_argument(
+        "--activate-voices",
+        action="store_true",
+        help="Write the downloaded demo profiles to profiles/voices.json.",
     )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -114,6 +148,45 @@ def download_huggingface_file(repo_id: str, repo_path: str, target: Path, *, for
     target.parent.mkdir(parents=True, exist_ok=True)
     print(f"Copying {archive} -> {target}")
     shutil.copyfile(archive, target)
+
+
+def download_huggingface_model_file(repo_id: str, repo_path: str, target: Path, *, force: bool) -> None:
+    if target.exists() and not force:
+        print(f"Exists, skipping: {target}")
+        return
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise SystemExit("huggingface_hub is required. Run `pixi run install-deps` first.") from exc
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() and force:
+        target.unlink()
+    print(f"Downloading HF model file: {repo_id}/{repo_path}")
+    downloaded = None
+    for attempt in range(1, 4):
+        try:
+            downloaded = Path(
+                hf_hub_download(
+                    repo_id=repo_id,
+                    filename=repo_path,
+                    repo_type="model",
+                    force_download=force,
+                )
+            )
+            break
+        except Exception as exc:
+            if attempt >= 3:
+                raise
+            print(
+                f"Download failed on attempt {attempt}/3: {exc}. "
+                f"Retrying in {attempt * 5}s..."
+            )
+            time.sleep(attempt * 5)
+    if downloaded is None:
+        raise RuntimeError(f"Failed to download {repo_id}/{repo_path}")
+    print(f"Copying {downloaded} -> {target}")
+    shutil.copyfile(downloaded, target)
 
 
 def extract_zip(zip_path: Path, target_dir: Path) -> None:
@@ -197,6 +270,102 @@ def maybe_download_v2pro_plus(*, force: bool) -> None:
     print(f"SV model    : {PRETRAINED_DIR / 'sv' / 'pretrained_eres2netv2w24s4ep4.ckpt'}")
 
 
+def split_speakers(raw_speakers: str) -> list[str]:
+    speakers = [speaker.strip() for speaker in raw_speakers.split(",") if speaker.strip()]
+    if not speakers:
+        raise SystemExit("--genshin-speakers did not contain any speaker names.")
+    return speakers
+
+
+def choose_genshin_file(files: list[str], speaker: str, suffix: str) -> str:
+    prefix = f"{GENSHIN_ROOT}/{speaker}/"
+    matches = [
+        item
+        for item in files
+        if item.startswith(prefix) and item.lower().endswith(suffix) and not item.endswith("train.log")
+    ]
+    if not matches:
+        raise SystemExit(f"No {suffix} file found for Genshin speaker: {speaker}")
+    return sorted(matches)[0]
+
+
+def choose_genshin_ref(files: list[str], speaker: str) -> str:
+    prefix = f"{GENSHIN_ROOT}/{speaker}/"
+    wavs = [item for item in files if item.startswith(prefix) and item.lower().endswith(".wav")]
+    if not wavs:
+        raise SystemExit(f"No reference wav file found for Genshin speaker: {speaker}")
+    calm_wavs = [item for item in wavs if "平静" in Path(item).stem]
+    return sorted(calm_wavs or wavs)[0]
+
+
+def prompt_from_reference(repo_path: str) -> str:
+    prompt = Path(repo_path).stem.strip()
+    if "-" in prompt:
+        prompt = prompt.split("-", 1)[1].strip()
+    return prompt
+
+
+def workspace_relative(path: Path) -> str:
+    return path.resolve().relative_to(WORKSPACE_ROOT.resolve()).as_posix()
+
+
+def write_genshin_profiles(profiles: list[dict[str, str]], *, activate: bool) -> None:
+    payload = {"voices": profiles}
+    GENSHIN_PROFILE_EXAMPLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    GENSHIN_PROFILE_EXAMPLE_PATH.write_text(text, encoding="utf-8")
+    print(f"Wrote profile example: {GENSHIN_PROFILE_EXAMPLE_PATH}")
+    if activate:
+        ACTIVE_PROFILE_PATH.write_text(text, encoding="utf-8")
+        print(f"Activated profiles: {ACTIVE_PROFILE_PATH}")
+
+
+def maybe_download_genshin_demo(repo_id: str, speakers: list[str], *, activate: bool, force: bool) -> None:
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise SystemExit("huggingface_hub is required. Run `pixi run install-deps` first.") from exc
+
+    print(f"Listing Genshin speaker files from Hugging Face: {repo_id}")
+    files = HfApi().list_repo_files(repo_id=repo_id, repo_type="model")
+    profiles = []
+    for speaker in speakers:
+        ckpt_repo_path = choose_genshin_file(files, speaker, ".ckpt")
+        pth_repo_path = choose_genshin_file(files, speaker, ".pth")
+        ref_repo_path = choose_genshin_ref(files, speaker)
+
+        speaker_dir = GENSHIN_MODEL_DIR / speaker
+        ckpt_target = speaker_dir / Path(ckpt_repo_path).name
+        pth_target = speaker_dir / Path(pth_repo_path).name
+        ref_target = speaker_dir / Path(ref_repo_path).name
+
+        download_huggingface_model_file(repo_id, ckpt_repo_path, ckpt_target, force=force)
+        download_huggingface_model_file(repo_id, pth_repo_path, pth_target, force=force)
+        download_huggingface_model_file(repo_id, ref_repo_path, ref_target, force=force)
+
+        voice_id = GENSHIN_VOICE_IDS.get(speaker, f"genshin-{speaker}")
+        profiles.append(
+            {
+                "id": voice_id,
+                "name": speaker,
+                "description": f"{speaker} from {repo_id} {GENSHIN_ROOT}.",
+                "ref_audio_path": workspace_relative(ref_target),
+                "prompt_text": prompt_from_reference(ref_repo_path),
+                "prompt_lang": "zh",
+                "text_lang": "zh",
+                "aux_ref_audio_paths": [],
+                "gpt_weights_path": workspace_relative(ckpt_target),
+                "sovits_weights_path": workspace_relative(pth_target),
+            }
+        )
+
+    write_genshin_profiles(profiles, activate=activate)
+    print("")
+    print("Genshin demo voices")
+    for profile in profiles:
+        print(f"- {profile['id']}: {profile['name']} ({profile['prompt_text']})")
+
+
 def main() -> None:
     args = parse_args()
     if not REPO_DIR.exists():
@@ -213,6 +382,13 @@ def main() -> None:
             maybe_download_uvr5(urls, force=args.force)
     if args.v2pro_plus:
         maybe_download_v2pro_plus(force=args.force)
+    if args.genshin_demo:
+        maybe_download_genshin_demo(
+            args.genshin_repo_id,
+            split_speakers(args.genshin_speakers),
+            activate=args.activate_voices,
+            force=args.force,
+        )
     print("Asset download step finished.")
 
 

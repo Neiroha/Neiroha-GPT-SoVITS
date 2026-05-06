@@ -49,6 +49,13 @@ pixi run install-assets
 pixi run install-v2pro-hf
 ```
 
+下载 Hugging Face 上别人训练好的原神多角色 demo，并自动写入
+`profiles/voices.json` 方便直接用 `voice` 切换说话人：
+
+```powershell
+pixi run install-genshin-demo-hf
+```
+
 也可以使用 Hugging Face 或 hf-mirror：
 
 ```powershell
@@ -68,6 +75,11 @@ Copy-Item profiles/voices.example.json profiles/voices.json
 ```
 
 然后把 `ref_audio_path` 和 `prompt_text` 改成真实数据。
+
+如果使用原神 demo 下载任务，它会额外生成
+`profiles/voices.genshin.example.json`，并把同样内容写到被 git 忽略的
+`profiles/voices.json`。默认包含 `genshin-paimon`、`genshin-keqing`、`genshin-klee`
+三个 voice id。
 
 ## Run
 

@@ -25,6 +25,18 @@ def main() -> None:
         run([sys.executable, "-m", "pip", "install", "-r", str(extra_req), "--no-deps"])
     if requirements.exists():
         run([sys.executable, "-m", "pip", "install", "-r", str(requirements)])
+    run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "fastapi[standard]>=0.115.2,<0.116",
+            "starlette>=0.37.2,<0.41",
+            "huggingface-hub>=0.26,<0.36",
+            "hf-xet>=1.1,<2",
+        ]
+    )
 
     print("GPT-SoVITS Python dependencies installed.")
 

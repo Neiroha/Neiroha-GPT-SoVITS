@@ -39,6 +39,11 @@ Local GPT-SoVITS extensions:
 - `text_split_method`
 - `top_k`, `top_p`, `temperature`, `seed`
 
+For the bundled Hugging Face Genshin demo downloader, the default voice ids are
+`genshin-paimon`, `genshin-keqing`, and `genshin-klee`. The generated
+`profiles/voices.json` points each voice at its own GPT checkpoint, SoVITS
+checkpoint, reference wav, and prompt text.
+
 ## Native GPT-SoVITS
 
 ```http

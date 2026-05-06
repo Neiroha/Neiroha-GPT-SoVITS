@@ -1,0 +1,40 @@
+{
+  "voices": [
+    {
+      "id": "genshin-paimon",
+      "name": "派蒙",
+      "description": "派蒙 from UnlimitedBurst/GPT-SoVITS 原神（已更新4.8）.",
+      "ref_audio_path": "runtime/models/hf/UnlimitedBurst__GPT-SoVITS/原神（已更新4.8）/派蒙/平静-好耶！《特尔克西的奇幻历险》出发咯！.wav",
+      "prompt_text": "好耶！《特尔克西的奇幻历险》出发咯！",
+      "prompt_lang": "zh",
+      "text_lang": "zh",
+      "aux_ref_audio_paths": [],
+      "gpt_weights_path": "runtime/models/hf/UnlimitedBurst__GPT-SoVITS/原神（已更新4.8）/派蒙/派蒙-e10.ckpt",
+      "sovits_weights_path": "runtime/models/hf/UnlimitedBurst__GPT-SoVITS/原神（已更新4.8）/派蒙/派蒙_e10_s19390.pth"
+    },
+    {
+      "id": "genshin-keqing",
+      "name": "刻晴",
+      "description": "刻晴 from UnlimitedBurst/GPT-SoVITS 原神（已更新4.8）.",
+      "ref_audio_path": "runtime/models/hf/UnlimitedBurst__GPT-SoVITS/原神（已更新4.8）/刻晴/这「七圣召唤」虽说是游戏，但对局之中也隐隐有策算谋略之理。.wav",
+      "prompt_text": "这「七圣召唤」虽说是游戏，但对局之中也隐隐有策算谋略之理。",
+      "prompt_lang": "zh",
+      "text_lang": "zh",
+      "aux_ref_audio_paths": [],
+      "gpt_weights_path": "runtime/models/hf/UnlimitedBurst__GPT-SoVITS/原神（已更新4.8）/刻晴/刻晴-e10.ckpt",
+      "sovits_weights_path": "runtime/models/hf/UnlimitedBurst__GPT-SoVITS/原神（已更新4.8）/刻晴/刻晴_e10_s190.pth"
+    },
+    {
+      "id": "genshin-klee",
+      "name": "可莉",
+      "description": "可莉 from UnlimitedBurst/GPT-SoVITS 原神（已更新4.8）.",
+      "ref_audio_path": "runtime/models/hf/UnlimitedBurst__GPT-SoVITS/原神（已更新4.8）/可莉/买东西那天也有一个人帮了开了款式，那个人好像叫.wav",
+      "prompt_text": "买东西那天也有一个人帮了开了款式，那个人好像叫",
+      "prompt_lang": "zh",
+      "text_lang": "zh",
+      "aux_ref_audio_paths": [],
+      "gpt_weights_path": "runtime/models/hf/UnlimitedBurst__GPT-SoVITS/原神（已更新4.8）/可莉/可莉-e10.ckpt",
+      "sovits_weights_path": "runtime/models/hf/UnlimitedBurst__GPT-SoVITS/原神（已更新4.8）/可莉/可莉_e10_s210.pth"
+    }
+  ]
+}

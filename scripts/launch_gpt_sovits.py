@@ -72,6 +72,8 @@ def first_non_empty(*values: Any) -> str:
 
 
 def model_dump(model: BaseModel) -> dict[str, Any]:
+    if isinstance(model, dict):
+        return dict(model)
     if hasattr(model, "model_dump"):
         return model.model_dump()
     return model.dict()
