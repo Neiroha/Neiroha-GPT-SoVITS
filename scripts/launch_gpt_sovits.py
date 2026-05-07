@@ -40,6 +40,8 @@ MODELS_ROOT = WORKSPACE_ROOT / "models"
 PRETRAINED_MODELS_DIR = MODELS_ROOT / "pretrained" / "GPT-SoVITS" / "GPT_SoVITS" / "pretrained_models"
 DEFAULT_CLONE_GPT_WEIGHTS = PRETRAINED_MODELS_DIR / "s1v3.ckpt"
 DEFAULT_CLONE_SOVITS_WEIGHTS = PRETRAINED_MODELS_DIR / "v2Pro" / "s2Gv2ProPlus.pth"
+CLONE_REFERENCE_MIN_SECONDS = 3.05
+CLONE_REFERENCE_MAX_SECONDS = 9.95
 RUNTIME_ROOT = WORKSPACE_ROOT / "runtime"
 RUNTIME_CACHE_ROOT = RUNTIME_ROOT / "cache"
 TEMP_ROOT = RUNTIME_ROOT / "temp"
@@ -1051,6 +1053,36 @@ def save_upload(upload: Optional[UploadFile], *, prefix: str) -> Optional[str]:
         return tmp.name
 
 
+def normalize_clone_reference_audio(ref_audio_path: str, *, repo_dir: Path) -> tuple[str, Optional[str]]:
+    resolved = resolve_existing_file(ref_audio_path, repo_dir=repo_dir, field_name="ref_audio_path", required=True)
+    audio, sample_rate = sf.read(resolved, always_2d=True, dtype="float32")
+    if sample_rate <= 0 or len(audio) <= 0:
+        raise ValueError(f"Reference audio is empty or unreadable: {resolved}")
+
+    original_seconds = len(audio) / sample_rate
+    normalized = audio
+    if original_seconds < CLONE_REFERENCE_MIN_SECONDS:
+        target_frames = int(np.ceil(CLONE_REFERENCE_MIN_SECONDS * sample_rate))
+        pad_frames = max(target_frames - len(audio), 0)
+        normalized = np.pad(audio, ((0, pad_frames), (0, 0)), mode="constant")
+    elif original_seconds > CLONE_REFERENCE_MAX_SECONDS:
+        target_frames = int(np.floor(CLONE_REFERENCE_MAX_SECONDS * sample_rate))
+        normalized = audio[:target_frames]
+    else:
+        return resolved, None
+
+    with tempfile.NamedTemporaryFile(delete=False, dir=UPLOAD_ROOT, prefix="clone_ref_norm_", suffix=".wav") as tmp:
+        normalized_path = tmp.name
+    sf.write(normalized_path, normalized, sample_rate)
+    normalized_seconds = len(normalized) / sample_rate
+    LOGGER.info(
+        "Normalized clone reference audio from %.3fs to %.3fs without modifying upstream GPT-SoVITS.",
+        original_seconds,
+        normalized_seconds,
+    )
+    return normalized_path, normalized_path
+
+
 def cleanup_temp_files(paths: Iterable[Optional[str]]) -> None:
     for path in paths:
         if not path:
@@ -1170,6 +1202,13 @@ def create_api_app(
                 "clone_speech": "/gpt-sovits/clone",
                 "clone_upload": "/gpt-sovits/clone/upload",
             },
+            "clone_reference_audio": {
+                "upstream_required_seconds": [3.0, 10.0],
+                "auto_normalize_without_upstream_patch": True,
+                "short_audio": "pad trailing silence",
+                "long_audio": "trim from start",
+                "normalized_seconds": [CLONE_REFERENCE_MIN_SECONDS, CLONE_REFERENCE_MAX_SECONDS],
+            },
         }
 
     @app.get("/speakers")
@@ -1250,9 +1289,14 @@ def create_api_app(
                 status_code=400,
             )
 
+        normalized_ref = None
         try:
             started_at = time.perf_counter()
             request, profile = request_with_clone(payload, runtime=runtime)
+            request["ref_audio_path"], normalized_ref = normalize_clone_reference_audio(
+                request["ref_audio_path"],
+                repo_dir=runtime.repo_dir,
+            )
             runtime.apply_profile_weights(profile)
             sample_rate, audio_data = runtime.synthesize_once(request)
             metrics = log_rtf(
@@ -1272,11 +1316,13 @@ def create_api_app(
             )
         except FileNotFoundError as exc:
             return openai_error(str(exc), status_code=404)
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, OSError) as exc:
             return openai_error(str(exc), status_code=400)
         except Exception as exc:
             LOGGER.exception("Clone synthesis failed.")
             return openai_error(str(exc), status_code=500, error_type="server_error")
+        finally:
+            cleanup_temp_files([normalized_ref])
 
     @app.get("/tts")
     def tts_get(
@@ -1420,6 +1466,7 @@ def create_api_app(
         ref_audio: Optional[UploadFile] = File(None),
     ):
         temp_ref = None
+        normalized_ref = None
         try:
             temp_ref = save_upload(ref_audio, prefix="clone_ref")
             payload = CloneSpeechRequest(
@@ -1436,6 +1483,10 @@ def create_api_app(
             )
             started_at = time.perf_counter()
             request, profile = request_with_clone(payload, runtime=runtime)
+            request["ref_audio_path"], normalized_ref = normalize_clone_reference_audio(
+                request["ref_audio_path"],
+                repo_dir=runtime.repo_dir,
+            )
             runtime.apply_profile_weights(profile)
             sample_rate, audio_data = runtime.synthesize_once(request)
             metrics = log_rtf(
@@ -1447,8 +1498,15 @@ def create_api_app(
                 started_at=started_at,
             )
             return audio_response(sample_rate, audio_data, request["media_type"], speaker=payload.speaker, metrics=metrics)
+        except FileNotFoundError as exc:
+            return openai_error(str(exc), status_code=404)
+        except (ValueError, RuntimeError, OSError) as exc:
+            return openai_error(str(exc), status_code=400)
+        except Exception as exc:
+            LOGGER.exception("Clone upload synthesis failed.")
+            return openai_error(str(exc), status_code=500, error_type="server_error")
         finally:
-            cleanup_temp_files([temp_ref])
+            cleanup_temp_files([temp_ref, normalized_ref])
 
     @app.post("/gpt-sovits/load")
     def load_model(payload: LoadRequest):
@@ -2067,7 +2125,7 @@ def build_gradio_admin_blocks(
             "endpoint": f"FastAPI 端点：`{base}`",
             "language": "语言",
             "trained_hint": "使用 `/v1/audio/voices` 中已有的已训练音色。",
-            "clone_hint": "上传参考音频并填写对应文本，使用 v2ProPlus 基座权重进行少样本声音克隆。",
+            "clone_hint": "上传参考音频并填写对应文本，使用 v2ProPlus 基座权重进行少样本声音克隆；过短会补静音，过长会临时裁剪，不改原仓库。",
             "status": "FastAPI 运行状态",
             "refresh": "刷新",
             "unload": "卸载模型",
@@ -2107,7 +2165,7 @@ def build_gradio_admin_blocks(
             "endpoint": f"FastAPI endpoint: `{base}`",
             "language": "Language",
             "trained_hint": "Use saved trained voices from `/v1/audio/voices`.",
-            "clone_hint": "Upload a reference clip and its transcript, then synthesize with the v2ProPlus base weights.",
+            "clone_hint": "Upload a reference clip and its transcript, then synthesize with v2ProPlus. Short clips are padded and long clips are trimmed in a temporary file without patching upstream.",
             "status": "FastAPI runtime status",
             "refresh": "Refresh",
             "unload": "Unload model",
