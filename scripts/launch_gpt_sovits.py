@@ -1770,6 +1770,75 @@ class ManagedApiProcess:
         return f"Managed API exited with code {self.process.returncode}."
 
 
+class ManagedGradioProcess:
+    def __init__(
+        self,
+        *,
+        host: str,
+        port: int,
+        api_base: str,
+        repo_dir: Path,
+        config_path: Path,
+        profiles_path: Path,
+        log_level: str,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.api_base = api_base
+        self.repo_dir = repo_dir
+        self.config_path = config_path
+        self.profiles_path = profiles_path
+        self.log_level = log_level
+        self.process: Optional[subprocess.Popen] = None
+
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def command(self) -> list[str]:
+        return [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--mode",
+            "admin-ui",
+            "--repo-dir",
+            str(self.repo_dir),
+            "--config",
+            str(self.config_path),
+            "--profiles",
+            str(self.profiles_path),
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+            "--api-base",
+            self.api_base,
+            "--log-level",
+            self.log_level,
+        ]
+
+    def start(self) -> str:
+        if self.is_running():
+            assert self.process is not None
+            return f"Admin UI is already running with PID {self.process.pid}."
+        self.process = subprocess.Popen(self.command(), cwd=WORKSPACE_ROOT)
+        time.sleep(1)
+        if self.process.poll() is not None:
+            return f"Admin UI process exited immediately with code {self.process.returncode}."
+        return f"Started admin UI PID {self.process.pid} on port {self.port}, API={self.api_base}."
+
+    def stop(self) -> str:
+        if not self.is_running():
+            return "Admin UI is not running."
+        assert self.process is not None
+        pid = self.process.pid
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+        return f"Stopped admin UI PID {pid}."
+
+
 def build_gradio_admin_blocks(
     api_base: str,
     registry: VoiceRegistry,
@@ -2300,7 +2369,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Launch GPT-SoVITS for Neiroha with native and OpenAI-compatible APIs.",
     )
-    parser.add_argument("--mode", choices=["api", "admin", "webui", "combined"], default="api")
+    parser.add_argument("--mode", choices=["api", "admin", "admin-ui", "webui", "combined"], default="api")
     parser.add_argument("--repo-dir", type=Path, default=DEFAULT_REPO_DIR)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--profiles", type=Path, default=DEFAULT_PROFILE_PATH)
@@ -2337,7 +2406,7 @@ def configure_logging() -> None:
 def resolve_port(mode: str, port: Optional[int]) -> int:
     if port is not None:
         return port
-    return 7860 if mode in {"admin", "webui"} else 9880
+    return 7860 if mode in {"admin", "admin-ui", "webui"} else 9880
 
 
 def resolve_api_port(api_base: str, explicit_port: Optional[int]) -> int:
@@ -2347,6 +2416,15 @@ def resolve_api_port(api_base: str, explicit_port: Optional[int]) -> int:
     if parsed.port is not None:
         return parsed.port
     return 9880
+
+
+def local_api_base(api_base: str, api_port: int) -> str:
+    parsed = urllib.parse.urlparse(api_base)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or "127.0.0.1"
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    return f"{scheme}://{host}:{api_port}"
 
 
 def main() -> None:
@@ -2363,7 +2441,7 @@ def main() -> None:
     )
     registry = VoiceRegistry(args.profiles, repo_dir=args.repo_dir.resolve())
 
-    if args.preload_model and args.mode not in {"admin", "webui"}:
+    if args.preload_model and args.mode != "admin-ui":
         runtime.load()
         default_profile = registry.get(args.default_voice)
         if default_profile is not None:
@@ -2378,28 +2456,34 @@ def main() -> None:
         args.config,
     )
 
-    if args.mode in {"admin", "webui"}:
-        managed_api_port = resolve_api_port(args.api_base, args.api_port)
-        process_manager = ManagedApiProcess(
-            api_host=args.api_host,
-            api_port=managed_api_port,
-            repo_dir=args.repo_dir,
-            config_path=args.config,
-            profiles_path=args.profiles,
-            device=args.device,
-            is_half=is_half,
-            default_voice_id=args.default_voice,
-            log_level=args.log_level,
-            rtf_log=not args.no_rtf_log,
-        )
-        if args.auto_start_api or args.mode == "webui":
-            LOGGER.info("Auto-starting managed FastAPI on %s:%s", args.api_host, managed_api_port)
-            LOGGER.info(process_manager.start(default_voice_id=args.default_voice, preload_model=args.preload_model))
-        blocks = build_gradio_admin_blocks(args.api_base, registry, process_manager=process_manager)
+    if args.mode == "admin-ui":
+        blocks = build_gradio_admin_blocks(args.api_base, registry, process_manager=None)
         blocks.launch(server_name=args.host, server_port=port, show_error=True)
         return
 
     app = create_api_app(runtime, registry, default_voice_id=args.default_voice, rtf_log=not args.no_rtf_log)
+
+    if args.mode in {"admin", "webui"}:
+        admin_port = port
+        api_port = resolve_api_port(args.api_base, args.api_port)
+        ui_api_base = local_api_base(args.api_base, api_port)
+        admin_process = ManagedGradioProcess(
+            host=args.host,
+            port=admin_port,
+            api_base=ui_api_base,
+            repo_dir=args.repo_dir,
+            config_path=args.config,
+            profiles_path=args.profiles,
+            log_level=args.log_level,
+        )
+        LOGGER.info("Starting FastAPI primary on %s:%s with admin UI child on %s:%s", args.api_host, api_port, args.host, admin_port)
+        LOGGER.info(admin_process.start())
+        try:
+            uvicorn.run(app, host=args.api_host, port=api_port, log_level=args.log_level)
+        finally:
+            LOGGER.info(admin_process.stop())
+        return
+
     if args.mode == "combined":
         import gradio as gr
 
