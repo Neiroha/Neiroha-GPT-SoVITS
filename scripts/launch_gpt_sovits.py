@@ -972,17 +972,27 @@ def audio_response(
     response_format: str,
     *,
     speaker: Any = "",
+    metrics: Optional[dict[str, float]] = None,
 ) -> Response:
     fmt = require_supported_format(response_format)
     content = pack_audio(audio_data, sample_rate, fmt)
     output_path = write_runtime_output(content, speaker or "speech", fmt)
+    headers = {
+        "Content-Disposition": f'inline; filename="{output_path.name}"',
+        "X-Neiroha-Output-Path": str(output_path),
+    }
+    if metrics:
+        headers.update(
+            {
+                "X-Neiroha-Audio-Seconds": f"{metrics.get('audio_seconds', 0.0):.6f}",
+                "X-Neiroha-Elapsed-Seconds": f"{metrics.get('elapsed_seconds', 0.0):.6f}",
+                "X-Neiroha-RTF": f"{metrics.get('rtf', 0.0):.6f}",
+            }
+        )
     return Response(
         content=content,
         media_type=CONTENT_TYPES[fmt],
-        headers={
-            "Content-Disposition": f'inline; filename="{output_path.name}"',
-            "X-Neiroha-Output-Path": str(output_path),
-        },
+        headers=headers,
     )
 
 
@@ -1015,20 +1025,21 @@ def log_rtf(
     sample_rate: int,
     audio_data: np.ndarray,
     started_at: float,
-) -> None:
-    if not enabled:
-        return
+) -> dict[str, float]:
     elapsed = max(time.perf_counter() - started_at, 0.0)
     duration = len(audio_data) / sample_rate if sample_rate else 0.0
     rtf = elapsed / duration if duration > 0 else 0.0
-    LOGGER.info(
-        "TTS performance mode=%s speaker=%s audio=%.3fs elapsed=%.3fs rtf=%.3f",
-        mode,
-        speaker,
-        duration,
-        elapsed,
-        rtf,
-    )
+    metrics = {"audio_seconds": duration, "elapsed_seconds": elapsed, "rtf": rtf}
+    if enabled:
+        LOGGER.info(
+            "TTS performance mode=%s speaker=%s audio=%.3fs elapsed=%.3fs rtf=%.3f",
+            mode,
+            speaker,
+            duration,
+            elapsed,
+            rtf,
+        )
+    return metrics
 
 
 def save_upload(upload: Optional[UploadFile], *, prefix: str) -> Optional[str]:
@@ -1075,6 +1086,8 @@ def create_api_app(
             "health": "/health",
             "openai_speech": "/v1/audio/speech",
             "native_clone": "/gpt-sovits/clone",
+            "native_clone_upload": "/gpt-sovits/clone/upload",
+            "capabilities": "/gpt-sovits/capabilities",
             "native_speech": "/tts",
             "admin": "/admin",
         }
@@ -1135,6 +1148,30 @@ def create_api_app(
             data.append(profile.to_native_voice(model_id=current_model_id))
         return {"object": "list", "data": data}
 
+    @app.get("/gpt-sovits/capabilities")
+    def capabilities():
+        return {
+            "object": "gpt_sovits.capabilities",
+            "speech_backends": {
+                "main_inference": {
+                    "backend": "pytorch",
+                    "onnx_supported": False,
+                    "note": "This launcher uses GPT-SoVITS' PyTorch TTS runtime. Upstream contains export tooling, but ONNX is not a drop-in inference backend here.",
+                },
+                "text_frontend": {
+                    "backend": "mixed",
+                    "onnxruntime_used_by": ["g2pw"],
+                },
+            },
+            "routes": {
+                "openai_speech": "/v1/audio/speech",
+                "trained_models": "/gpt-sovits/models",
+                "trained_voices": "/gpt-sovits/voices",
+                "clone_speech": "/gpt-sovits/clone",
+                "clone_upload": "/gpt-sovits/clone/upload",
+            },
+        }
+
     @app.get("/speakers")
     def speakers():
         profiles = registry.list_profiles()
@@ -1156,6 +1193,8 @@ def create_api_app(
                 "native_models": "/gpt-sovits/models",
                 "native_voices": "/gpt-sovits/voices",
                 "native_clone": "/gpt-sovits/clone",
+                "native_clone_upload": "/gpt-sovits/clone/upload",
+                "capabilities": "/gpt-sovits/capabilities",
                 "models": "/v1/models",
                 "voices": "/v1/audio/voices",
                 "load": "/gpt-sovits/load",
@@ -1186,8 +1225,15 @@ def create_api_app(
             runtime.apply_profile_weights(profile)
             sample_rate, audio_data = runtime.synthesize_once(request)
             speaker = profile.id if profile else extract_voice_id(payload.voice) or default_voice_id or "default"
-            log_rtf(rtf_log, mode="trained", speaker=speaker, sample_rate=sample_rate, audio_data=audio_data, started_at=started_at)
-            return audio_response(sample_rate, audio_data, request["media_type"], speaker=speaker)
+            metrics = log_rtf(
+                rtf_log,
+                mode="trained",
+                speaker=speaker,
+                sample_rate=sample_rate,
+                audio_data=audio_data,
+                started_at=started_at,
+            )
+            return audio_response(sample_rate, audio_data, request["media_type"], speaker=speaker, metrics=metrics)
         except FileNotFoundError as exc:
             return openai_error(str(exc), status_code=404)
         except (ValueError, RuntimeError) as exc:
@@ -1209,12 +1255,20 @@ def create_api_app(
             request, profile = request_with_clone(payload, runtime=runtime)
             runtime.apply_profile_weights(profile)
             sample_rate, audio_data = runtime.synthesize_once(request)
-            log_rtf(rtf_log, mode="clone", speaker=payload.speaker or "clone", sample_rate=sample_rate, audio_data=audio_data, started_at=started_at)
+            metrics = log_rtf(
+                rtf_log,
+                mode="clone",
+                speaker=payload.speaker or "clone",
+                sample_rate=sample_rate,
+                audio_data=audio_data,
+                started_at=started_at,
+            )
             return audio_response(
                 sample_rate,
                 audio_data,
                 request["media_type"],
                 speaker=payload.speaker or "clone",
+                metrics=metrics,
             )
         except FileNotFoundError as exc:
             return openai_error(str(exc), status_code=404)
@@ -1294,8 +1348,15 @@ def create_api_app(
                 )
             started_at = time.perf_counter()
             sample_rate, audio_data = runtime.synthesize_once(request)
-            log_rtf(rtf_log, mode="native", speaker="native", sample_rate=sample_rate, audio_data=audio_data, started_at=started_at)
-            return audio_response(sample_rate, audio_data, request["media_type"], speaker="native")
+            metrics = log_rtf(
+                rtf_log,
+                mode="native",
+                speaker="native",
+                sample_rate=sample_rate,
+                audio_data=audio_data,
+                started_at=started_at,
+            )
+            return audio_response(sample_rate, audio_data, request["media_type"], speaker="native", metrics=metrics)
         except FileNotFoundError as exc:
             return json_response({"message": str(exc)}, status_code=404)
         except (ValueError, RuntimeError) as exc:
@@ -1332,8 +1393,15 @@ def create_api_app(
             }
             started_at = time.perf_counter()
             sample_rate, audio_data = runtime.synthesize_once(request)
-            log_rtf(rtf_log, mode="upload", speaker="upload", sample_rate=sample_rate, audio_data=audio_data, started_at=started_at)
-            return audio_response(sample_rate, audio_data, response_format, speaker="upload")
+            metrics = log_rtf(
+                rtf_log,
+                mode="upload",
+                speaker="upload",
+                sample_rate=sample_rate,
+                audio_data=audio_data,
+                started_at=started_at,
+            )
+            return audio_response(sample_rate, audio_data, response_format, speaker="upload", metrics=metrics)
         finally:
             cleanup_temp_files([temp_ref])
 
@@ -1370,8 +1438,15 @@ def create_api_app(
             request, profile = request_with_clone(payload, runtime=runtime)
             runtime.apply_profile_weights(profile)
             sample_rate, audio_data = runtime.synthesize_once(request)
-            log_rtf(rtf_log, mode="clone-upload", speaker=payload.speaker, sample_rate=sample_rate, audio_data=audio_data, started_at=started_at)
-            return audio_response(sample_rate, audio_data, request["media_type"], speaker=payload.speaker)
+            metrics = log_rtf(
+                rtf_log,
+                mode="clone-upload",
+                speaker=payload.speaker,
+                sample_rate=sample_rate,
+                audio_data=audio_data,
+                started_at=started_at,
+            )
+            return audio_response(sample_rate, audio_data, request["media_type"], speaker=payload.speaker, metrics=metrics)
         finally:
             cleanup_temp_files([temp_ref])
 
@@ -1611,6 +1686,18 @@ class ManagedApiProcess:
         except (OSError, urllib.error.URLError):
             return False
 
+    def external_admin_ready(self) -> bool:
+        capabilities_url = f"http://127.0.0.1:{self.api_port}/gpt-sovits/capabilities"
+        try:
+            with urllib.request.urlopen(capabilities_url, timeout=2) as response:
+                if response.status != 200:
+                    return False
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError, urllib.error.URLError):
+            return False
+        routes = payload.get("routes", {}) if isinstance(payload, dict) else {}
+        return routes.get("clone_upload") == "/gpt-sovits/clone/upload"
+
     def command(self, default_voice_id: str, preload_model: bool) -> list[str]:
         command = [
             sys.executable,
@@ -1648,7 +1735,12 @@ class ManagedApiProcess:
         if self.is_running():
             return f"Managed API is already running with PID {self.process.pid}."
         if self.external_health_ok():
-            return f"FastAPI is already reachable on port {self.api_port}; using the external process."
+            if self.external_admin_ready():
+                return f"FastAPI is already reachable on port {self.api_port}; using the external process."
+            return (
+                f"Port {self.api_port} already has a FastAPI process, but it does not expose the current "
+                "admin routes such as /gpt-sovits/clone/upload. Stop that old process or switch ports, then start again."
+            )
         selected_voice = strip_text(default_voice_id) or strip_text(self.default_voice_id)
         command = self.command(selected_voice, preload_model)
         self.process = subprocess.Popen(command, cwd=WORKSPACE_ROOT)
@@ -1803,6 +1895,43 @@ def build_gradio_admin_blocks(
         except Exception as exc:
             return f"ERROR: {exc}"
 
+    def audio_file_from_response(response: requests.Response, speaker: str) -> str:
+        output_header = strip_text(response.headers.get("X-Neiroha-Output-Path"))
+        if output_header and Path(output_header).exists():
+            return output_header
+        output_path = write_runtime_output(response.content, speaker or "preview", "wav")
+        return str(output_path)
+
+    def response_metrics_text(response: requests.Response, output_path: str) -> str:
+        rtf = response.headers.get("X-Neiroha-RTF")
+        audio_seconds = response.headers.get("X-Neiroha-Audio-Seconds")
+        elapsed_seconds = response.headers.get("X-Neiroha-Elapsed-Seconds")
+        if not rtf:
+            return (
+                "RTF: unavailable\n"
+                "The connected FastAPI process did not return performance headers. "
+                "Restart FastAPI from this admin page if it is an older process.\n"
+                f"Output: {output_path}"
+            )
+        return (
+            f"RTF: {float(rtf):.3f}\n"
+            f"Audio: {float(audio_seconds or 0):.3f}s\n"
+            f"Elapsed: {float(elapsed_seconds or 0):.3f}s\n"
+            f"Output: {output_path}"
+        )
+
+    def http_error_text(exc: requests.HTTPError, path: str) -> str:
+        response = exc.response
+        if response is not None and response.status_code == 404 and path == "/gpt-sovits/clone/upload":
+            return (
+                "Clone upload endpoint not found on the connected FastAPI process. "
+                "This usually means port 12080/9880 is still serving an older launcher. "
+                "Stop that process or change ports, then start FastAPI again from the admin page."
+            )
+        if response is None:
+            return str(exc)
+        return f"HTTP {response.status_code}: {response.text}"
+
     def trained_synthesize_preview(
         text: str,
         voice: str,
@@ -1817,17 +1946,20 @@ def build_gradio_admin_blocks(
             "speed": speed,
             "text_lang": text_lang or None,
         }
-        response = requests.post(api_url("/v1/audio/speech"), json=payload, timeout=300)
-
-        response.raise_for_status()
-        output_path = write_runtime_output(response.content, voice or "preview", "wav")
-        return str(output_path)
+        try:
+            response = requests.post(api_url("/v1/audio/speech"), json=payload, timeout=300)
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            return None, http_error_text(exc, "/v1/audio/speech")
+        except requests.RequestException as exc:
+            return None, f"Request failed: {exc}"
+        output_path = audio_file_from_response(response, voice or "preview")
+        return output_path, response_metrics_text(response, output_path)
 
     def clone_synthesize_preview(
         text: str,
         speaker: str,
         ref_audio_file: Optional[str],
-        ref_audio_path: str,
         prompt_text: str,
         text_lang: str,
         prompt_lang: str,
@@ -1835,7 +1967,9 @@ def build_gradio_admin_blocks(
         gpt_weights_path: str,
         sovits_weights_path: str,
     ):
-        if ref_audio_file:
+        if not ref_audio_file:
+            return None, "请先上传参考音频后再合成克隆音色。"
+        try:
             with open(ref_audio_file, "rb") as audio_file:
                 files = {"ref_audio": (Path(ref_audio_file).name, audio_file, "audio/wav")}
                 data = {
@@ -1850,60 +1984,175 @@ def build_gradio_admin_blocks(
                     "sovits_weights_path": sovits_weights_path or "",
                 }
                 response = requests.post(api_url("/gpt-sovits/clone/upload"), data=data, files=files, timeout=300)
-        else:
-            payload = {
-                "model": OPENAI_MODEL_ALIAS,
-                "speaker": speaker or "clone",
-                "input": text,
-                "response_format": "wav",
-                "speed": speed,
-                "text_lang": text_lang or "zh",
-                "prompt_lang": prompt_lang or text_lang or "zh",
-                "prompt_text": prompt_text or "",
-                "ref_audio_path": ref_audio_path or None,
-                "gpt_weights_path": gpt_weights_path or None,
-                "sovits_weights_path": sovits_weights_path or None,
-            }
-            response = requests.post(api_url("/gpt-sovits/clone"), json=payload, timeout=300)
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            return None, http_error_text(exc, "/gpt-sovits/clone/upload")
+        except requests.RequestException as exc:
+            return None, f"Request failed: {exc}"
+        output_path = audio_file_from_response(response, speaker or "clone")
+        return output_path, response_metrics_text(response, output_path)
 
-        response.raise_for_status()
-        output_path = write_runtime_output(response.content, speaker or "clone", "wav")
-        return str(output_path)
+    UI_TEXT = {
+        "中文": {
+            "title": "# Neiroha GPT-SoVITS 管理台",
+            "endpoint": f"FastAPI 端点：`{base}`",
+            "language": "语言",
+            "trained_hint": "使用 `/v1/audio/voices` 中已有的已训练音色。",
+            "clone_hint": "上传参考音频并填写对应文本，使用 v2ProPlus 基座权重进行少样本声音克隆。",
+            "status": "FastAPI 运行状态",
+            "refresh": "刷新",
+            "unload": "卸载模型",
+            "process": "托管 FastAPI 进程",
+            "default_voice": "默认音色",
+            "preload": "启动 API 时预加载选中的音色",
+            "start_api": "启动 FastAPI",
+            "stop_api": "停止 FastAPI",
+            "config": "TTS 配置路径",
+            "gpt_weights": "GPT 权重路径",
+            "sovits_weights": "SoVITS 权重路径",
+            "load": "加载 / 应用",
+            "set_gpt": "只设置 GPT",
+            "set_sovits": "只设置 SoVITS",
+            "voice_profile": "音色配置",
+            "text": "文本",
+            "text_language": "文本语言",
+            "speed": "速度",
+            "trained_button": "合成已训练音色",
+            "clone_button": "合成克隆音色",
+            "output": "输出",
+            "rtf": "性能 / RTF",
+            "speaker": "输出说话人名",
+            "prompt_language": "参考音频语言",
+            "reference_upload": "上传参考音频",
+            "prompt_text": "参考音频对应文本",
+            "clone_gpt": "克隆 GPT 权重",
+            "clone_sovits": "克隆 SoVITS 权重",
+            "profiles": "/v1/audio/voices",
+            "native_models": "/gpt-sovits/models",
+            "native_voices": "/gpt-sovits/voices",
+            "refresh_voices": "刷新音色",
+            "refresh_native": "刷新原生模型视图",
+        },
+        "English": {
+            "title": "# Neiroha GPT-SoVITS Admin",
+            "endpoint": f"FastAPI endpoint: `{base}`",
+            "language": "Language",
+            "trained_hint": "Use saved trained voices from `/v1/audio/voices`.",
+            "clone_hint": "Upload a reference clip and its transcript, then synthesize with the v2ProPlus base weights.",
+            "status": "FastAPI runtime status",
+            "refresh": "Refresh",
+            "unload": "Unload model",
+            "process": "Managed FastAPI process",
+            "default_voice": "Default voice",
+            "preload": "Preload selected voice on API start",
+            "start_api": "Start FastAPI",
+            "stop_api": "Stop FastAPI",
+            "config": "TTS config path",
+            "gpt_weights": "GPT weights path",
+            "sovits_weights": "SoVITS weights path",
+            "load": "Load / Apply",
+            "set_gpt": "Set GPT only",
+            "set_sovits": "Set SoVITS only",
+            "voice_profile": "Voice profile",
+            "text": "Text",
+            "text_language": "Text language",
+            "speed": "Speed",
+            "trained_button": "Synthesize trained voice",
+            "clone_button": "Synthesize clone",
+            "output": "Output",
+            "rtf": "Performance / RTF",
+            "speaker": "Output speaker name",
+            "prompt_language": "Prompt language",
+            "reference_upload": "Reference audio upload",
+            "prompt_text": "Prompt text matching reference audio",
+            "clone_gpt": "Clone GPT weights",
+            "clone_sovits": "Clone SoVITS weights",
+            "profiles": "/v1/audio/voices",
+            "native_models": "/gpt-sovits/models",
+            "native_voices": "/gpt-sovits/voices",
+            "refresh_voices": "Refresh voices",
+            "refresh_native": "Refresh native model view",
+        },
+    }
+
+    def ui_value(language: str, key: str) -> str:
+        return UI_TEXT.get(language, UI_TEXT["中文"])[key]
 
     def ui_copy(language: str) -> tuple[str, str, str, str]:
-        if language == "English":
-            return (
-                "# Neiroha GPT-SoVITS Admin",
-                f"FastAPI endpoint: `{base}`",
-                "Use saved trained voices from `/v1/audio/voices`.",
-                "Use v2ProPlus base weights with a reference audio clip and its transcript.",
-            )
         return (
-            "# Neiroha GPT-SoVITS 管理台",
-            f"FastAPI 端点：`{base}`",
-            "使用 `/v1/audio/voices` 中已有的已训练音色。",
-            "使用 v2ProPlus 基座权重、参考音频和对应文本进行少样本声音克隆。",
+            ui_value(language, "title"),
+            ui_value(language, "endpoint"),
+            ui_value(language, "trained_hint"),
+            ui_value(language, "clone_hint"),
+        )
+
+    def ui_updates(language: str):
+        return (
+            ui_value(language, "title"),
+            ui_value(language, "endpoint"),
+            gr.update(label=ui_value(language, "language")),
+            gr.update(label=ui_value(language, "status")),
+            gr.update(value=ui_value(language, "refresh")),
+            gr.update(value=ui_value(language, "unload")),
+            gr.update(label=ui_value(language, "process")),
+            gr.update(label=ui_value(language, "default_voice")),
+            gr.update(label=ui_value(language, "preload")),
+            gr.update(value=ui_value(language, "start_api")),
+            gr.update(value=ui_value(language, "stop_api")),
+            gr.update(value=ui_value(language, "refresh")),
+            gr.update(label=ui_value(language, "config")),
+            gr.update(label=ui_value(language, "gpt_weights")),
+            gr.update(label=ui_value(language, "sovits_weights")),
+            gr.update(value=ui_value(language, "load")),
+            gr.update(value=ui_value(language, "set_gpt")),
+            gr.update(value=ui_value(language, "set_sovits")),
+            ui_value(language, "trained_hint"),
+            gr.update(label=ui_value(language, "voice_profile")),
+            gr.update(label=ui_value(language, "text")),
+            gr.update(label=ui_value(language, "text_language")),
+            gr.update(label=ui_value(language, "speed")),
+            gr.update(value=ui_value(language, "trained_button")),
+            gr.update(label=ui_value(language, "output")),
+            gr.update(label=ui_value(language, "rtf")),
+            ui_value(language, "clone_hint"),
+            gr.update(label=ui_value(language, "text")),
+            gr.update(label=ui_value(language, "speaker")),
+            gr.update(label=ui_value(language, "text_language")),
+            gr.update(label=ui_value(language, "prompt_language")),
+            gr.update(label=ui_value(language, "speed")),
+            gr.update(label=ui_value(language, "reference_upload")),
+            gr.update(label=ui_value(language, "prompt_text")),
+            gr.update(label=ui_value(language, "clone_gpt")),
+            gr.update(label=ui_value(language, "clone_sovits")),
+            gr.update(value=ui_value(language, "clone_button")),
+            gr.update(label=ui_value(language, "output")),
+            gr.update(label=ui_value(language, "rtf")),
+            gr.update(label=ui_value(language, "profiles")),
+            gr.update(label=ui_value(language, "native_models")),
+            gr.update(label=ui_value(language, "native_voices")),
+            gr.update(value=ui_value(language, "refresh_voices")),
+            gr.update(value=ui_value(language, "refresh_native")),
         )
 
     with gr.Blocks(title="Neiroha GPT-SoVITS Admin") as blocks:
         title_md = gr.Markdown(ui_copy("中文")[0])
         endpoint_md = gr.Markdown(ui_copy("中文")[1])
-        language_radio = gr.Radio(["中文", "English"], value="中文", label="Language / 语言")
-        with gr.Tab("API Status"):
-            status_box = gr.Code(value=status_text, language="json", label="FastAPI runtime status")
+        language_radio = gr.Radio(["中文", "English"], value="中文", label=ui_value("中文", "language"))
+        with gr.Tab("API 状态"):
+            status_box = gr.Code(value=status_text, language="json", label=ui_value("中文", "status"))
             with gr.Row():
-                refresh_btn = gr.Button("Refresh")
-                unload_btn = gr.Button("Unload model")
+                refresh_btn = gr.Button(ui_value("中文", "refresh"))
+                unload_btn = gr.Button(ui_value("中文", "unload"))
             refresh_btn.click(status_text, outputs=status_box)
             unload_btn.click(unload_model, outputs=status_box)
-        with gr.Tab("API Process"):
-            process_box = gr.Textbox(value=managed_status_text, label="Managed FastAPI process")
-            process_voice = gr.Dropdown(choices=voice_choices(), value=voice_choices()[0], label="Default voice")
-            preload_checkbox = gr.Checkbox(value=False, label="Preload selected voice on API start")
+        with gr.Tab("API 进程"):
+            process_box = gr.Textbox(value=managed_status_text, label=ui_value("中文", "process"))
+            process_voice = gr.Dropdown(choices=voice_choices(), value=voice_choices()[0], label=ui_value("中文", "default_voice"))
+            preload_checkbox = gr.Checkbox(value=False, label=ui_value("中文", "preload"))
             with gr.Row():
-                start_api_btn = gr.Button("Start FastAPI")
-                stop_api_btn = gr.Button("Stop FastAPI")
-                process_refresh_btn = gr.Button("Refresh")
+                start_api_btn = gr.Button(ui_value("中文", "start_api"))
+                stop_api_btn = gr.Button(ui_value("中文", "stop_api"))
+                process_refresh_btn = gr.Button(ui_value("中文", "refresh"))
             start_api_btn.click(
                 start_api,
                 inputs=[process_voice, preload_checkbox],
@@ -1911,35 +2160,36 @@ def build_gradio_admin_blocks(
             )
             stop_api_btn.click(stop_api, outputs=[process_box, status_box])
             process_refresh_btn.click(managed_status_text, outputs=process_box)
-        with gr.Tab("Load / Weights"):
+        with gr.Tab("加载 / 权重"):
             config_input = gr.Textbox(
                 value=str(DEFAULT_CONFIG_PATH),
-                label="TTS config path",
+                label=ui_value("中文", "config"),
             )
             gpt_input = gr.Textbox(
                 value=str(PRETRAINED_MODELS_DIR / "s1v3.ckpt"),
-                label="GPT weights path",
+                label=ui_value("中文", "gpt_weights"),
             )
             sovits_input = gr.Textbox(
                 value=str(PRETRAINED_MODELS_DIR / "v2Pro" / "s2Gv2ProPlus.pth"),
-                label="SoVITS weights path",
+                label=ui_value("中文", "sovits_weights"),
             )
             with gr.Row():
-                load_btn = gr.Button("Load / Apply")
-                gpt_btn = gr.Button("Set GPT only")
-                sovits_btn = gr.Button("Set SoVITS only")
+                load_btn = gr.Button(ui_value("中文", "load"))
+                gpt_btn = gr.Button(ui_value("中文", "set_gpt"))
+                sovits_btn = gr.Button(ui_value("中文", "set_sovits"))
             load_btn.click(load_model, inputs=[config_input, gpt_input, sovits_input], outputs=status_box)
             gpt_btn.click(set_gpt_weights, inputs=gpt_input, outputs=status_box)
             sovits_btn.click(set_sovits_weights, inputs=sovits_input, outputs=status_box)
-        with gr.Tab("Trained Voice Test / 已训练音色测试"):
+        with gr.Tab("已训练音色测试"):
             trained_hint = gr.Markdown(ui_copy("中文")[2])
-            voice_dropdown = gr.Dropdown(choices=voice_choices(), value=voice_choices()[0], label="Voice profile")
-            trained_text_input = gr.Textbox(label="Text / 文本", lines=4)
+            voice_dropdown = gr.Dropdown(choices=voice_choices(), value=voice_choices()[0], label=ui_value("中文", "voice_profile"))
+            trained_text_input = gr.Textbox(label=ui_value("中文", "text"), lines=4)
             with gr.Row():
-                trained_text_lang = gr.Textbox(value="zh", label="Text language / 文本语言")
-                trained_speed = gr.Slider(0.25, 4.0, value=1.0, step=0.05, label="Speed / 速度")
-            trained_synth_btn = gr.Button("Synthesize trained voice / 合成已训练音色")
-            trained_audio_output = gr.Audio(label="Output / 输出", type="filepath")
+                trained_text_lang = gr.Textbox(value="zh", label=ui_value("中文", "text_language"))
+                trained_speed = gr.Slider(0.25, 4.0, value=1.0, step=0.05, label=ui_value("中文", "speed"))
+            trained_synth_btn = gr.Button(ui_value("中文", "trained_button"))
+            trained_audio_output = gr.Audio(label=ui_value("中文", "output"), type="filepath")
+            trained_metrics_box = gr.Textbox(label=ui_value("中文", "rtf"), lines=4)
             trained_synth_btn.click(
                 trained_synthesize_preview,
                 inputs=[
@@ -1948,31 +2198,30 @@ def build_gradio_admin_blocks(
                     trained_text_lang,
                     trained_speed,
                 ],
-                outputs=trained_audio_output,
+                outputs=[trained_audio_output, trained_metrics_box],
             )
-        with gr.Tab("Clone Test / 声音克隆测试"):
+        with gr.Tab("声音克隆测试"):
             clone_hint = gr.Markdown(ui_copy("中文")[3])
-            clone_text_input = gr.Textbox(label="Text / 文本", lines=4)
-            clone_speaker = gr.Textbox(value="clone", label="Output speaker name / 输出说话人名")
+            clone_text_input = gr.Textbox(label=ui_value("中文", "text"), lines=4)
+            clone_speaker = gr.Textbox(value="clone", label=ui_value("中文", "speaker"))
             with gr.Row():
-                clone_text_lang = gr.Textbox(value="zh", label="Text language / 文本语言")
-                clone_prompt_lang = gr.Textbox(value="zh", label="Prompt language / 参考音频语言")
-                clone_speed = gr.Slider(0.25, 4.0, value=1.0, step=0.05, label="Speed / 速度")
-            clone_ref_audio_file = gr.Audio(type="filepath", label="Reference audio upload / 上传参考音频")
-            clone_ref_audio_path = gr.Textbox(label="Reference audio path / 参考音频路径")
-            clone_prompt_text = gr.Textbox(label="Prompt text matching reference audio / 参考音频对应文本", lines=2)
+                clone_text_lang = gr.Textbox(value="zh", label=ui_value("中文", "text_language"))
+                clone_prompt_lang = gr.Textbox(value="zh", label=ui_value("中文", "prompt_language"))
+                clone_speed = gr.Slider(0.25, 4.0, value=1.0, step=0.05, label=ui_value("中文", "speed"))
+            clone_ref_audio_file = gr.Audio(type="filepath", label=ui_value("中文", "reference_upload"))
+            clone_prompt_text = gr.Textbox(label=ui_value("中文", "prompt_text"), lines=2)
             with gr.Row():
-                clone_gpt_input = gr.Textbox(value=str(DEFAULT_CLONE_GPT_WEIGHTS), label="Clone GPT weights / 克隆 GPT 权重")
-                clone_sovits_input = gr.Textbox(value=str(DEFAULT_CLONE_SOVITS_WEIGHTS), label="Clone SoVITS weights / 克隆 SoVITS 权重")
-            clone_synth_btn = gr.Button("Synthesize clone / 合成克隆音色")
-            clone_audio_output = gr.Audio(label="Output / 输出", type="filepath")
+                clone_gpt_input = gr.Textbox(value=str(DEFAULT_CLONE_GPT_WEIGHTS), label=ui_value("中文", "clone_gpt"))
+                clone_sovits_input = gr.Textbox(value=str(DEFAULT_CLONE_SOVITS_WEIGHTS), label=ui_value("中文", "clone_sovits"))
+            clone_synth_btn = gr.Button(ui_value("中文", "clone_button"))
+            clone_audio_output = gr.Audio(label=ui_value("中文", "output"), type="filepath")
+            clone_metrics_box = gr.Textbox(label=ui_value("中文", "rtf"), lines=4)
             clone_synth_btn.click(
                 clone_synthesize_preview,
                 inputs=[
                     clone_text_input,
                     clone_speaker,
                     clone_ref_audio_file,
-                    clone_ref_audio_path,
                     clone_prompt_text,
                     clone_text_lang,
                     clone_prompt_lang,
@@ -1980,22 +2229,69 @@ def build_gradio_admin_blocks(
                     clone_gpt_input,
                     clone_sovits_input,
                 ],
-                outputs=clone_audio_output,
+                outputs=[clone_audio_output, clone_metrics_box],
             )
-        with gr.Tab("Voices"):
-            profiles_box = gr.Code(value=profiles_text, language="json", label="/v1/audio/voices")
-            gr.Button("Refresh voices").click(profiles_text, outputs=profiles_box)
-            native_models_box = gr.Code(value=native_models_text, language="json", label="/gpt-sovits/models")
-            native_voices_box = gr.Code(value=native_voices_text, language="json", label="/gpt-sovits/voices")
-            gr.Button("Refresh native model view").click(
+        with gr.Tab("说话人"):
+            profiles_box = gr.Code(value=profiles_text, language="json", label=ui_value("中文", "profiles"))
+            voices_refresh_btn = gr.Button(ui_value("中文", "refresh_voices"))
+            voices_refresh_btn.click(profiles_text, outputs=profiles_box)
+            native_models_box = gr.Code(value=native_models_text, language="json", label=ui_value("中文", "native_models"))
+            native_voices_box = gr.Code(value=native_voices_text, language="json", label=ui_value("中文", "native_voices"))
+            native_refresh_btn = gr.Button(ui_value("中文", "refresh_native"))
+            native_refresh_btn.click(
                 lambda: (native_models_text(), native_voices_text()),
                 outputs=[native_models_box, native_voices_box],
             )
 
         language_radio.change(
-            ui_copy,
+            ui_updates,
             inputs=language_radio,
-            outputs=[title_md, endpoint_md, trained_hint, clone_hint],
+            outputs=[
+                title_md,
+                endpoint_md,
+                language_radio,
+                status_box,
+                refresh_btn,
+                unload_btn,
+                process_box,
+                process_voice,
+                preload_checkbox,
+                start_api_btn,
+                stop_api_btn,
+                process_refresh_btn,
+                config_input,
+                gpt_input,
+                sovits_input,
+                load_btn,
+                gpt_btn,
+                sovits_btn,
+                trained_hint,
+                voice_dropdown,
+                trained_text_input,
+                trained_text_lang,
+                trained_speed,
+                trained_synth_btn,
+                trained_audio_output,
+                trained_metrics_box,
+                clone_hint,
+                clone_text_input,
+                clone_speaker,
+                clone_text_lang,
+                clone_prompt_lang,
+                clone_speed,
+                clone_ref_audio_file,
+                clone_prompt_text,
+                clone_gpt_input,
+                clone_sovits_input,
+                clone_synth_btn,
+                clone_audio_output,
+                clone_metrics_box,
+                profiles_box,
+                native_models_box,
+                native_voices_box,
+                voices_refresh_btn,
+                native_refresh_btn,
+            ],
         )
     return blocks.queue(max_size=8, default_concurrency_limit=1)
 
