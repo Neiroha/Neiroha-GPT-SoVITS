@@ -2,8 +2,8 @@
 
 FastAPI is the real runtime API and defaults to `http://127.0.0.1:9880`.
 The Gradio admin panel is a separate management UI on `http://127.0.0.1:7860`.
-It can connect to an existing FastAPI process or start/stop a managed one from
-the browser.
+The normal `admin` task starts FastAPI as the primary process and launches the
+admin UI as a child process.
 
 ## Health
 
@@ -54,6 +54,12 @@ Every non-streaming synthesis writes a copy under `runtime/outputs/` using
 `speaker_YYYYMMDDHHMMSS.ext` naming and returns that path in the
 `X-Neiroha-Output-Path` response header.
 
+Non-streaming synthesis also returns performance headers:
+
+- `X-Neiroha-Audio-Seconds`
+- `X-Neiroha-Elapsed-Seconds`
+- `X-Neiroha-RTF`
+
 ## Native GPT-SoVITS
 
 ```http
@@ -65,6 +71,7 @@ GET  /set_sovits_weights
 GET  /control
 GET  /gpt-sovits/models
 GET  /gpt-sovits/voices
+GET  /gpt-sovits/capabilities
 POST /gpt-sovits/clone
 POST /gpt-sovits/clone/upload
 ```
@@ -75,6 +82,22 @@ POST /gpt-sovits/clone/upload
 models list their real configured voices from `profiles/voices.json`; clone
 models do not invent voices and require reference audio plus matching
 `prompt_text`.
+
+GPT-SoVITS v2ProPlus upstream requires clone reference audio to be in the
+3-10 second range. This launcher does not patch the upstream submodule. Instead,
+for `POST /gpt-sovits/clone` and `POST /gpt-sovits/clone/upload` only, it
+normalizes the reference audio into a temporary file before inference:
+
+- shorter than `3.05s`: pad trailing silence
+- longer than `9.95s`: trim from the start
+- already in range: use the original path/upload
+
+The original upload or source file is not modified, and temporary files are
+removed after synthesis. For long reference audio, write `prompt_text` for the
+first `9.95s`, because that is the effective prompt audio after trimming.
+
+`GET /gpt-sovits/capabilities` exposes this behavior through
+`clone_reference_audio.auto_normalize_without_upstream_patch`.
 
 RTF logging is enabled by default for non-streaming synthesis:
 
@@ -104,4 +127,27 @@ POST /gpt-sovits/speech/upload
   "gpt_weights_path": "",
   "sovits_weights_path": ""
 }
+```
+
+## Admin Model Downloads
+
+The Gradio admin page includes a `模型下载` tab. It starts downloads in a child
+process and writes logs to:
+
+- `runtime/logs/admin-download.out.log`
+- `runtime/logs/admin-download.err.log`
+
+Available admin actions:
+
+- download common pretrained base assets
+- download v2ProPlus clone base weights
+- download a trained multi-role demo model set and optionally activate
+  `profiles/voices.json`
+
+The CLI fallback is:
+
+```powershell
+pixi run install-assets
+pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --v2pro-plus
+pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --genshin-demo --activate-voices
 ```

@@ -46,25 +46,10 @@ pixi run install-assets
 预训练基座、官方权重和下载好的角色模型都会放在顶层 `models/` 下。
 `runtime/` 只保留运行时缓存、上传临时文件和生成语音输出。
 
-下载 Hugging Face 上的官方 v2ProPlus 测试权重：
-
-```powershell
-pixi run install-v2pro-hf
-```
-
-下载 Hugging Face 上别人训练好的原神多角色 demo，并自动写入
-`profiles/voices.json` 方便直接用 `voice` 切换说话人：
-
-```powershell
-pixi run install-genshin-demo-hf
-```
-
-也可以使用 Hugging Face 或 hf-mirror：
-
-```powershell
-pixi run install-assets-hf
-pixi run install-assets-hf-mirror
-```
+更多下载入口放在 Gradio 管理页的 `模型下载` tab：预训练基座、v2ProPlus 克隆基座、
+已训练多角色 demo 都可以从网页启动。下载日志写到 `runtime/logs/admin-download.*.log`。
+需要纯 CLI 时可以直接调用 `scripts/download_gpt_sovits_assets.py`。公开训练包候选见
+`docs/model-sources.md`。
 
 ## Voice Profiles
 
@@ -86,47 +71,35 @@ Copy-Item profiles/voices.example.json profiles/voices.json
 
 ## Run
 
-FastAPI 主服务，默认端口 `9880`。纯 API 启动时可以用 `--default-voice`
-选择默认 voice；OpenAI 风格说话人列表始终可从 `/v1/audio/voices` 查看：
+FastAPI 主服务，默认端口 `9880`。OpenAI 风格说话人列表始终可从
+`/v1/audio/voices` 查看：
 
 ```powershell
 pixi run api
-pixi run python scripts/launch_gpt_sovits.py --mode api --port 12080 --default-voice genshin-paimon --preload-model
+pixi run api-12080
 ```
 
-Gradio 管理控制台，默认端口 `7860`。它是额外的网页管理界面：可以连接已经运行的
-FastAPI，也可以在网页里启动/停止一个由它管理的 FastAPI 进程：
+Gradio 管理控制台，默认端口 `7860`。`admin` task 会先启动 FastAPI 主进程，
+然后把 Gradio 管理页作为子进程拉起。FastAPI API 在 `9880`，Gradio 管理页在
+`7860`：
 
 ```powershell
 pixi run admin
-```
-
-日常一键 WebUI 会先打开同一个 admin 控制台，并自动拉起 FastAPI。FastAPI API 在
-`9880`，Gradio 管理页在 `7860`：
-
-```powershell
-pixi run webui
 ```
 
 如果 Windows 把 `9880` 放进了 TCP excluded port range，`9880` 不会显示为被进程占用，
 但依然无法绑定。这种情况下可以先用备用端口启动：
 
 ```powershell
-pixi run webui-12080
-```
-
-然后把 Neiroha 里的 Base URL 临时改成 `http://127.0.0.1:12080`。也可以直接开
-`12080` 的 admin 控制台：
-
-```powershell
 pixi run admin-12080
 ```
 
-启动时预加载模型：
+然后把 Neiroha 里的 Base URL 临时改成 `http://127.0.0.1:12080`。
+
+需要预加载或改默认 voice 时直接调用 launcher：
 
 ```powershell
-pixi run api-preload
-pixi run webui-preload
+pixi run python scripts/launch_gpt_sovits.py --mode api --port 12080 --default-voice genshin-paimon --preload-model
 ```
 
 ## Neiroha 配置
@@ -153,8 +126,13 @@ Neiroha 里已经有 `gptSovits` adapter：
 
 Gradio 管理页里也拆成了两个测试页：
 
-- `Trained Voice Test / 已训练音色测试`
-- `Clone Test / 声音克隆测试`
+- `已训练音色测试`
+- `声音克隆测试`
+
+GPT-SoVITS upstream 对 v2ProPlus 克隆参考音频有 3-10 秒限制。本 launcher 不改
+`GPT-SoVITS` 子仓库，而是在 clone API 入口临时规整参考音频：短于 `3.05s` 会补尾部静音，
+长于 `9.95s` 会从开头裁剪，原始上传或本地文件不会被修改。长音频的 `prompt_text` 应该对应
+前 `9.95s`。
 
 非流式推理默认会在终端打印 RTF 性能日志：
 

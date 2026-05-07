@@ -35,17 +35,8 @@ torchvision = { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvisi
 submodule-init = { cmd = "git submodule update --init --recursive" }
 install-deps = { cmd = "python scripts/install_gpt_sovits_deps.py" }
 install-assets = { cmd = "python scripts/download_gpt_sovits_assets.py --source modelscope" }
-install-assets-hf = { cmd = "python scripts/download_gpt_sovits_assets.py --source hf" }
-install-assets-hf-mirror = { cmd = "python scripts/download_gpt_sovits_assets.py --source hf-mirror" }
-install-v2pro-hf = { cmd = "python scripts/download_gpt_sovits_assets.py --source hf --v2pro-plus --skip-base-assets" }
-install-genshin-demo-hf = { cmd = "python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --genshin-demo --activate-voices" }
 api = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 9880" }
 api-12080 = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 12080" }
-api-preload = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 9880 --preload-model" }
-api-genshin-paimon-12080 = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 12080 --default-voice genshin-paimon --preload-model" }
 admin = { cmd = "python scripts/launch_gpt_sovits.py --mode admin --port 7860 --api-base http://127.0.0.1:9880 --api-port 9880" }
 admin-12080 = { cmd = "python scripts/launch_gpt_sovits.py --mode admin --port 7860 --api-base http://127.0.0.1:12080 --api-port 12080" }
-webui = { cmd = "python scripts/launch_gpt_sovits.py --mode webui --port 7860 --api-base http://127.0.0.1:9880 --api-port 9880 --auto-start-api" }
-webui-12080 = { cmd = "python scripts/launch_gpt_sovits.py --mode webui --port 7860 --api-base http://127.0.0.1:12080 --api-port 12080 --auto-start-api" }
-webui-preload = { cmd = "python scripts/launch_gpt_sovits.py --mode webui --port 7860 --api-base http://127.0.0.1:9880 --api-port 9880 --auto-start-api --preload-model" }
 launcher-help = { cmd = "python scripts/launch_gpt_sovits.py --help" }

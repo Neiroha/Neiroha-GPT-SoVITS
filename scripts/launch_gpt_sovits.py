@@ -42,14 +42,18 @@ DEFAULT_CLONE_GPT_WEIGHTS = PRETRAINED_MODELS_DIR / "s1v3.ckpt"
 DEFAULT_CLONE_SOVITS_WEIGHTS = PRETRAINED_MODELS_DIR / "v2Pro" / "s2Gv2ProPlus.pth"
 CLONE_REFERENCE_MIN_SECONDS = 3.05
 CLONE_REFERENCE_MAX_SECONDS = 9.95
+DEFAULT_DOWNLOAD_SOURCE = "modelscope"
+DEFAULT_DEMO_REPO_ID = "UnlimitedBurst/GPT-SoVITS"
+DEFAULT_DEMO_SPEAKERS = "派蒙,刻晴,可莉"
 RUNTIME_ROOT = WORKSPACE_ROOT / "runtime"
 RUNTIME_CACHE_ROOT = RUNTIME_ROOT / "cache"
+RUNTIME_LOG_ROOT = RUNTIME_ROOT / "logs"
 TEMP_ROOT = RUNTIME_ROOT / "temp"
 UPLOAD_ROOT = TEMP_ROOT / "uploads"
 OUTPUT_ROOT = RUNTIME_ROOT / "outputs"
 DEFAULT_CONFIG_PATH = RUNTIME_CACHE_ROOT / "tts_infer.yaml"
 
-for path in (RUNTIME_ROOT, RUNTIME_CACHE_ROOT, TEMP_ROOT, UPLOAD_ROOT, OUTPUT_ROOT):
+for path in (RUNTIME_ROOT, RUNTIME_CACHE_ROOT, RUNTIME_LOG_ROOT, TEMP_ROOT, UPLOAD_ROOT, OUTPUT_ROOT):
     path.mkdir(parents=True, exist_ok=True)
 
 os.environ.setdefault("TMPDIR", str(TEMP_ROOT))
@@ -1897,6 +1901,72 @@ class ManagedGradioProcess:
         return f"Stopped admin UI PID {pid}."
 
 
+class ManagedDownloadProcess:
+    def __init__(self) -> None:
+        self.process: Optional[subprocess.Popen] = None
+        self.name = ""
+        self.stdout_path = RUNTIME_LOG_ROOT / "admin-download.out.log"
+        self.stderr_path = RUNTIME_LOG_ROOT / "admin-download.err.log"
+
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def start(self, name: str, args: list[str]) -> str:
+        if self.is_running():
+            assert self.process is not None
+            return f"Download already running: {self.name} (PID {self.process.pid}).\n\n{self.tail()}"
+        self.name = name
+        command = [sys.executable, "-u", str(WORKSPACE_ROOT / "scripts" / "download_gpt_sovits_assets.py"), *args]
+        self.stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.stdout_path.open("w", encoding="utf-8") as stdout_file, self.stderr_path.open(
+            "w",
+            encoding="utf-8",
+        ) as stderr_file:
+            self.process = subprocess.Popen(
+                command,
+                cwd=WORKSPACE_ROOT,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True,
+            )
+        return self.status()
+
+    def stop(self) -> str:
+        if not self.is_running():
+            return f"No active download.\n\n{self.tail()}"
+        assert self.process is not None
+        pid = self.process.pid
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+        return f"Stopped download PID {pid}.\n\n{self.tail()}"
+
+    def status(self) -> str:
+        if self.is_running():
+            assert self.process is not None
+            return f"Download running: {self.name} (PID {self.process.pid}).\n\n{self.tail()}"
+        if self.process is None:
+            return f"No download has been started from this admin page.\n\n{self.tail()}"
+        return f"Download exited with code {self.process.returncode}: {self.name}.\n\n{self.tail()}"
+
+    def tail(self, lines: int = 80) -> str:
+        chunks = []
+        for label, path in (("stdout", self.stdout_path), ("stderr", self.stderr_path)):
+            if not path.exists():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                chunks.append(f"[{label}] unable to read {path}: {exc}")
+                continue
+            tail_text = "\n".join(text.splitlines()[-lines:])
+            if tail_text:
+                chunks.append(f"[{label}] {path}\n{tail_text}")
+        return "\n\n".join(chunks) or "No download logs yet."
+
+
 def build_gradio_admin_blocks(
     api_base: str,
     registry: VoiceRegistry,
@@ -1907,6 +1977,7 @@ def build_gradio_admin_blocks(
     import requests
 
     base = api_base.rstrip("/")
+    download_manager = ManagedDownloadProcess()
 
     def api_url(path: str) -> str:
         return f"{base}{path if path.startswith('/') else '/' + path}"
@@ -2021,6 +2092,43 @@ def build_gradio_admin_blocks(
             return json.dumps(response.json(), ensure_ascii=False, indent=2)
         except Exception as exc:
             return f"ERROR: {exc}"
+
+    def force_arg(force: bool) -> list[str]:
+        return ["--force"] if force else []
+
+    def start_base_assets_download(source: str, force: bool) -> str:
+        return download_manager.start(
+            "pretrained base assets",
+            ["--source", source or DEFAULT_DOWNLOAD_SOURCE, *force_arg(force)],
+        )
+
+    def start_v2pro_download(source: str, force: bool) -> str:
+        return download_manager.start(
+            "v2ProPlus clone base weights",
+            [
+                "--source",
+                source or DEFAULT_DOWNLOAD_SOURCE,
+                "--skip-base-assets",
+                "--v2pro-plus",
+                *force_arg(force),
+            ],
+        )
+
+    def start_demo_download(source: str, repo_id: str, speakers: str, activate: bool, force: bool) -> str:
+        args = [
+            "--source",
+            source or DEFAULT_DOWNLOAD_SOURCE,
+            "--skip-base-assets",
+            "--genshin-demo",
+            "--genshin-repo-id",
+            strip_text(repo_id) or DEFAULT_DEMO_REPO_ID,
+            "--genshin-speakers",
+            strip_text(speakers) or DEFAULT_DEMO_SPEAKERS,
+            *force_arg(force),
+        ]
+        if activate:
+            args.append("--activate-voices")
+        return download_manager.start("trained demo voices", args)
 
     def audio_file_from_response(response: requests.Response, speaker: str) -> str:
         output_header = strip_text(response.headers.get("X-Neiroha-Output-Path"))
@@ -2140,6 +2248,16 @@ def build_gradio_admin_blocks(
             "load": "加载 / 应用",
             "set_gpt": "只设置 GPT",
             "set_sovits": "只设置 SoVITS",
+            "download_source": "下载源",
+            "download_force": "强制重新下载",
+            "download_repo": "训练模型仓库",
+            "download_speakers": "示例说话人",
+            "download_activate": "下载后激活 voices.json",
+            "download_base": "下载预训练基座",
+            "download_v2pro": "下载 v2ProPlus 克隆基座",
+            "download_demo": "下载已训练多角色 demo",
+            "download_stop": "停止下载",
+            "download_status": "下载状态 / 日志",
             "voice_profile": "音色配置",
             "text": "文本",
             "text_language": "文本语言",
@@ -2180,6 +2298,16 @@ def build_gradio_admin_blocks(
             "load": "Load / Apply",
             "set_gpt": "Set GPT only",
             "set_sovits": "Set SoVITS only",
+            "download_source": "Download source",
+            "download_force": "Force redownload",
+            "download_repo": "Trained model repo",
+            "download_speakers": "Demo speakers",
+            "download_activate": "Activate voices.json after download",
+            "download_base": "Download pretrained base",
+            "download_v2pro": "Download v2ProPlus clone base",
+            "download_demo": "Download trained multi-role demo",
+            "download_stop": "Stop download",
+            "download_status": "Download status / logs",
             "voice_profile": "Voice profile",
             "text": "Text",
             "text_language": "Text language",
@@ -2233,6 +2361,17 @@ def build_gradio_admin_blocks(
             gr.update(value=ui_value(language, "load")),
             gr.update(value=ui_value(language, "set_gpt")),
             gr.update(value=ui_value(language, "set_sovits")),
+            gr.update(label=ui_value(language, "download_source")),
+            gr.update(label=ui_value(language, "download_force")),
+            gr.update(label=ui_value(language, "download_repo")),
+            gr.update(label=ui_value(language, "download_speakers")),
+            gr.update(label=ui_value(language, "download_activate")),
+            gr.update(value=ui_value(language, "download_base")),
+            gr.update(value=ui_value(language, "download_v2pro")),
+            gr.update(value=ui_value(language, "download_demo")),
+            gr.update(value=ui_value(language, "refresh")),
+            gr.update(value=ui_value(language, "download_stop")),
+            gr.update(label=ui_value(language, "download_status")),
             ui_value(language, "trained_hint"),
             gr.update(label=ui_value(language, "voice_profile")),
             gr.update(label=ui_value(language, "text")),
@@ -2307,6 +2446,46 @@ def build_gradio_admin_blocks(
             load_btn.click(load_model, inputs=[config_input, gpt_input, sovits_input], outputs=status_box)
             gpt_btn.click(set_gpt_weights, inputs=gpt_input, outputs=status_box)
             sovits_btn.click(set_sovits_weights, inputs=sovits_input, outputs=status_box)
+        with gr.Tab("模型下载"):
+            with gr.Row():
+                download_source = gr.Dropdown(
+                    choices=["modelscope", "hf", "hf-mirror"],
+                    value=DEFAULT_DOWNLOAD_SOURCE,
+                    label=ui_value("中文", "download_source"),
+                )
+                download_force = gr.Checkbox(value=False, label=ui_value("中文", "download_force"))
+            with gr.Row():
+                download_repo = gr.Textbox(value=DEFAULT_DEMO_REPO_ID, label=ui_value("中文", "download_repo"))
+                download_speakers = gr.Textbox(value=DEFAULT_DEMO_SPEAKERS, label=ui_value("中文", "download_speakers"))
+                download_activate = gr.Checkbox(value=True, label=ui_value("中文", "download_activate"))
+            with gr.Row():
+                download_base_btn = gr.Button(ui_value("中文", "download_base"))
+                download_v2pro_btn = gr.Button(ui_value("中文", "download_v2pro"))
+                download_demo_btn = gr.Button(ui_value("中文", "download_demo"))
+                download_refresh_btn = gr.Button(ui_value("中文", "refresh"))
+                download_stop_btn = gr.Button(ui_value("中文", "download_stop"))
+            download_status_box = gr.Textbox(
+                value=download_manager.status,
+                label=ui_value("中文", "download_status"),
+                lines=16,
+            )
+            download_base_btn.click(
+                start_base_assets_download,
+                inputs=[download_source, download_force],
+                outputs=download_status_box,
+            )
+            download_v2pro_btn.click(
+                start_v2pro_download,
+                inputs=[download_source, download_force],
+                outputs=download_status_box,
+            )
+            download_demo_btn.click(
+                start_demo_download,
+                inputs=[download_source, download_repo, download_speakers, download_activate, download_force],
+                outputs=download_status_box,
+            )
+            download_refresh_btn.click(download_manager.status, outputs=download_status_box)
+            download_stop_btn.click(download_manager.stop, outputs=download_status_box)
         with gr.Tab("已训练音色测试"):
             trained_hint = gr.Markdown(ui_copy("中文")[2])
             voice_dropdown = gr.Dropdown(choices=voice_choices(), value=voice_choices()[0], label=ui_value("中文", "voice_profile"))
@@ -2392,6 +2571,17 @@ def build_gradio_admin_blocks(
                 load_btn,
                 gpt_btn,
                 sovits_btn,
+                download_source,
+                download_force,
+                download_repo,
+                download_speakers,
+                download_activate,
+                download_base_btn,
+                download_v2pro_btn,
+                download_demo_btn,
+                download_refresh_btn,
+                download_stop_btn,
+                download_status_box,
                 trained_hint,
                 voice_dropdown,
                 trained_text_input,
