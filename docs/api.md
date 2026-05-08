@@ -141,8 +141,14 @@ Available admin actions:
 
 - download common pretrained base assets
 - download v2ProPlus clone base weights
-- download a trained multi-role demo model set and optionally activate
+- download a small trained multi-role demo model set and optionally activate
   `profiles/voices.json`
+- download an extended ready-to-use Genshin voices set
+- download AI-Hobbyist shared multi-speaker weights
+
+The AI-Hobbyist shared weights do not include reference audio. The admin
+download writes `models/voices/hf/AI-Hobbyist__GPT-SoVits-V2-models/shared_models.json`;
+add `ref_audio_path` and `prompt_text` before exposing those presets as voices.
 
 The CLI fallback is:
 
@@ -150,4 +156,6 @@ The CLI fallback is:
 pixi run install-assets
 pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --v2pro-plus
 pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --genshin-demo --activate-voices
+pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --genshin-demo --genshin-extended-demo --activate-voices
+pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --shared-multispeaker-demo
 ```

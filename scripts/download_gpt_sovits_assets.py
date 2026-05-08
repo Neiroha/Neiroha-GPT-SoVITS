@@ -60,10 +60,59 @@ GENSHIN_REPO_ID = "UnlimitedBurst/GPT-SoVITS"
 GENSHIN_ROOT = "原神（已更新4.8）"
 GENSHIN_MODEL_DIR = MODELS_ROOT / "voices" / "hf" / "UnlimitedBurst__GPT-SoVITS" / GENSHIN_ROOT
 GENSHIN_DEFAULT_SPEAKERS = ["派蒙", "刻晴", "可莉"]
+GENSHIN_EXTENDED_SPEAKERS = [
+    "派蒙",
+    "刻晴",
+    "可莉",
+    "胡桃",
+    "甘雨",
+    "雷电将军",
+    "纳西妲",
+    "神里绫华",
+    "八重神子",
+    "钟离",
+]
 GENSHIN_VOICE_IDS = {
     "派蒙": "genshin-paimon",
     "刻晴": "genshin-keqing",
     "可莉": "genshin-klee",
+    "胡桃": "genshin-hutao",
+    "甘雨": "genshin-ganyu",
+    "雷电将军": "genshin-raiden-shogun",
+    "纳西妲": "genshin-nahida",
+    "神里绫华": "genshin-kamisato-ayaka",
+    "八重神子": "genshin-yae-miko",
+    "钟离": "genshin-zhongli",
+}
+
+SHARED_REPO_ID = "AI-Hobbyist/GPT-SoVits-V2-models"
+SHARED_MODEL_DIR = MODELS_ROOT / "voices" / "hf" / "AI-Hobbyist__GPT-SoVits-V2-models"
+SHARED_MODEL_INDEX_PATH = SHARED_MODEL_DIR / "shared_models.json"
+SHARED_PRESETS = {
+    "genshin-en": {
+        "name": "Genshin Impact EN 5.1",
+        "language": "en",
+        "model_id": "ai-hobbyist-genshin-en-5.1",
+        "gpt": "Genshin_Impact/EN/GPT_GenshinImpact_EN_5.1.ckpt",
+        "sovits": "Genshin_Impact/EN/SV_GenshinImpact_EN_5.1.pth",
+        "notes": "Shared GPT-SoVITS v2 weights. Add reference audio and prompt text before exposing voices.",
+    },
+    "genshin-ja": {
+        "name": "Genshin Impact JA 5.1",
+        "language": "ja",
+        "model_id": "ai-hobbyist-genshin-ja-5.1",
+        "gpt": "Genshin_Impact/JA/GPT_GenshinImpact_JA_5.1.ckpt",
+        "sovits": "Genshin_Impact/JA/SV_GenshinImpact_JA_5.1.pth",
+        "notes": "Shared GPT-SoVITS v2 weights. Add reference audio and prompt text before exposing voices.",
+    },
+    "wuthering-cn": {
+        "name": "Wuthering Waves CN 1.3",
+        "language": "zh",
+        "model_id": "ai-hobbyist-wuthering-cn-1.3",
+        "gpt": "Wuthering_Waves/CN/GPT_WutheringWaves_CN_1.3.ckpt",
+        "sovits": "Wuthering_Waves/CN/SV_WutheringWaves_CN_1.3.pth",
+        "notes": "Shared GPT-SoVITS v2 weights. Add reference audio and prompt text before exposing voices.",
+    },
 }
 
 
@@ -89,6 +138,11 @@ def parse_args() -> argparse.Namespace:
         help="Download a small ready-to-switch multi-speaker Genshin GPT-SoVITS demo set.",
     )
     parser.add_argument(
+        "--genshin-extended-demo",
+        action="store_true",
+        help="Use the larger built-in Genshin speaker set for --genshin-demo.",
+    )
+    parser.add_argument(
         "--genshin-speakers",
         default=",".join(GENSHIN_DEFAULT_SPEAKERS),
         help="Comma-separated speaker names from UnlimitedBurst/GPT-SoVITS.",
@@ -102,6 +156,21 @@ def parse_args() -> argparse.Namespace:
         "--activate-voices",
         action="store_true",
         help="Write the downloaded demo profiles to profiles/voices.json.",
+    )
+    parser.add_argument(
+        "--shared-multispeaker-demo",
+        action="store_true",
+        help="Download shared multi-speaker GPT-SoVITS v2 weights from AI-Hobbyist.",
+    )
+    parser.add_argument(
+        "--shared-repo-id",
+        default=SHARED_REPO_ID,
+        help="Hugging Face repo id for shared multi-speaker weights.",
+    )
+    parser.add_argument(
+        "--shared-presets",
+        default=",".join(SHARED_PRESETS),
+        help=f"Comma-separated shared presets: {', '.join(SHARED_PRESETS)}.",
     )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -299,6 +368,16 @@ def split_speakers(raw_speakers: str) -> list[str]:
     return speakers
 
 
+def split_presets(raw_presets: str) -> list[str]:
+    presets = [preset.strip() for preset in raw_presets.split(",") if preset.strip()]
+    if not presets:
+        raise SystemExit("--shared-presets did not contain any preset names.")
+    unknown = [preset for preset in presets if preset not in SHARED_PRESETS]
+    if unknown:
+        raise SystemExit(f"Unknown shared presets: {', '.join(unknown)}. Supported: {', '.join(SHARED_PRESETS)}")
+    return presets
+
+
 def choose_genshin_file(files: list[str], speaker: str, suffix: str) -> str:
     prefix = f"{GENSHIN_ROOT}/{speaker}/"
     matches = [
@@ -352,9 +431,13 @@ def maybe_download_genshin_demo(repo_id: str, speakers: list[str], *, activate: 
     files = HfApi().list_repo_files(repo_id=repo_id, repo_type="model")
     profiles = []
     for speaker in speakers:
-        ckpt_repo_path = choose_genshin_file(files, speaker, ".ckpt")
-        pth_repo_path = choose_genshin_file(files, speaker, ".pth")
-        ref_repo_path = choose_genshin_ref(files, speaker)
+        try:
+            ckpt_repo_path = choose_genshin_file(files, speaker, ".ckpt")
+            pth_repo_path = choose_genshin_file(files, speaker, ".pth")
+            ref_repo_path = choose_genshin_ref(files, speaker)
+        except SystemExit as exc:
+            print(f"WARNING: skipping Genshin speaker {speaker}: {exc}")
+            continue
 
         speaker_dir = GENSHIN_MODEL_DIR / speaker
         ckpt_target = speaker_dir / Path(ckpt_repo_path).name
@@ -384,11 +467,51 @@ def maybe_download_genshin_demo(repo_id: str, speakers: list[str], *, activate: 
             }
         )
 
+    if not profiles:
+        raise SystemExit("No Genshin voices were downloaded or available for profile generation.")
+
     write_genshin_profiles(profiles, activate=activate)
     print("")
     print("Genshin demo voices")
     for profile in profiles:
         print(f"- {profile['id']}: {profile['name']} ({profile['prompt_text']})")
+
+
+def maybe_download_shared_multispeaker(repo_id: str, presets: list[str], *, force: bool) -> None:
+    print(f"Downloading shared multi-speaker GPT-SoVITS weights from Hugging Face: {repo_id}")
+    records = []
+    for preset_name in presets:
+        preset = SHARED_PRESETS[preset_name]
+        preset_dir = SHARED_MODEL_DIR / preset_name
+        gpt_target = preset_dir / Path(preset["gpt"]).name
+        sovits_target = preset_dir / Path(preset["sovits"]).name
+
+        download_huggingface_model_file(repo_id, preset["gpt"], gpt_target, force=force)
+        download_huggingface_model_file(repo_id, preset["sovits"], sovits_target, force=force)
+
+        records.append(
+            {
+                "preset": preset_name,
+                "repo_id": repo_id,
+                "name": preset["name"],
+                "model_id": preset["model_id"],
+                "model_type": "shared-trained",
+                "language": preset["language"],
+                "gpt_weights_path": workspace_relative(gpt_target),
+                "sovits_weights_path": workspace_relative(sovits_target),
+                "requires_reference_audio": True,
+                "notes": preset["notes"],
+            }
+        )
+
+    SHARED_MODEL_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"models": records}
+    SHARED_MODEL_INDEX_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"Wrote shared model index: {SHARED_MODEL_INDEX_PATH}")
+    print("")
+    print("Shared multi-speaker model presets")
+    for record in records:
+        print(f"- {record['preset']}: {record['name']} ({record['language']})")
 
 
 def main() -> None:
@@ -408,10 +531,17 @@ def main() -> None:
     if args.v2pro_plus:
         maybe_download_v2pro_plus(force=args.force)
     if args.genshin_demo:
+        speakers = GENSHIN_EXTENDED_SPEAKERS if args.genshin_extended_demo else split_speakers(args.genshin_speakers)
         maybe_download_genshin_demo(
             args.genshin_repo_id,
-            split_speakers(args.genshin_speakers),
+            speakers,
             activate=args.activate_voices,
+            force=args.force,
+        )
+    if args.shared_multispeaker_demo:
+        maybe_download_shared_multispeaker(
+            args.shared_repo_id,
+            split_presets(args.shared_presets),
             force=args.force,
         )
     print("Asset download step finished.")

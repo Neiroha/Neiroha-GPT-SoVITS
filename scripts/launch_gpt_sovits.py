@@ -45,6 +45,9 @@ CLONE_REFERENCE_MAX_SECONDS = 9.95
 DEFAULT_DOWNLOAD_SOURCE = "modelscope"
 DEFAULT_DEMO_REPO_ID = "UnlimitedBurst/GPT-SoVITS"
 DEFAULT_DEMO_SPEAKERS = "派蒙,刻晴,可莉"
+DEFAULT_EXTENDED_DEMO_SPEAKERS = "派蒙,刻晴,可莉,胡桃,甘雨,雷电将军,纳西妲,神里绫华,八重神子,钟离"
+DEFAULT_SHARED_REPO_ID = "AI-Hobbyist/GPT-SoVits-V2-models"
+DEFAULT_SHARED_PRESETS = "genshin-en,genshin-ja,wuthering-cn"
 RUNTIME_ROOT = WORKSPACE_ROOT / "runtime"
 RUNTIME_CACHE_ROOT = RUNTIME_ROOT / "cache"
 RUNTIME_LOG_ROOT = RUNTIME_ROOT / "logs"
@@ -2130,6 +2133,37 @@ def build_gradio_admin_blocks(
             args.append("--activate-voices")
         return download_manager.start("trained demo voices", args)
 
+    def start_extended_demo_download(source: str, repo_id: str, activate: bool, force: bool) -> str:
+        args = [
+            "--source",
+            source or DEFAULT_DOWNLOAD_SOURCE,
+            "--skip-base-assets",
+            "--genshin-demo",
+            "--genshin-extended-demo",
+            "--genshin-repo-id",
+            strip_text(repo_id) or DEFAULT_DEMO_REPO_ID,
+            *force_arg(force),
+        ]
+        if activate:
+            args.append("--activate-voices")
+        return download_manager.start("extended trained demo voices", args)
+
+    def start_shared_multispeaker_download(source: str, repo_id: str, presets: str, force: bool) -> str:
+        return download_manager.start(
+            "shared multi-speaker weights",
+            [
+                "--source",
+                source or DEFAULT_DOWNLOAD_SOURCE,
+                "--skip-base-assets",
+                "--shared-multispeaker-demo",
+                "--shared-repo-id",
+                strip_text(repo_id) or DEFAULT_SHARED_REPO_ID,
+                "--shared-presets",
+                strip_text(presets) or DEFAULT_SHARED_PRESETS,
+                *force_arg(force),
+            ],
+        )
+
     def audio_file_from_response(response: requests.Response, speaker: str) -> str:
         output_header = strip_text(response.headers.get("X-Neiroha-Output-Path"))
         if output_header and Path(output_header).exists():
@@ -2252,10 +2286,14 @@ def build_gradio_admin_blocks(
             "download_force": "强制重新下载",
             "download_repo": "训练模型仓库",
             "download_speakers": "示例说话人",
+            "download_shared_repo": "共享权重仓库",
+            "download_shared_presets": "共享权重预设",
             "download_activate": "下载后激活 voices.json",
             "download_base": "下载预训练基座",
             "download_v2pro": "下载 v2ProPlus 克隆基座",
-            "download_demo": "下载已训练多角色 demo",
+            "download_demo": "下载 3 角色 demo",
+            "download_extended_demo": "下载扩展多角色 voices",
+            "download_shared": "下载共享多说话人权重",
             "download_stop": "停止下载",
             "download_status": "下载状态 / 日志",
             "voice_profile": "音色配置",
@@ -2302,10 +2340,14 @@ def build_gradio_admin_blocks(
             "download_force": "Force redownload",
             "download_repo": "Trained model repo",
             "download_speakers": "Demo speakers",
+            "download_shared_repo": "Shared-weights repo",
+            "download_shared_presets": "Shared presets",
             "download_activate": "Activate voices.json after download",
             "download_base": "Download pretrained base",
             "download_v2pro": "Download v2ProPlus clone base",
-            "download_demo": "Download trained multi-role demo",
+            "download_demo": "Download 3-role demo",
+            "download_extended_demo": "Download extended voices",
+            "download_shared": "Download shared multi-speaker weights",
             "download_stop": "Stop download",
             "download_status": "Download status / logs",
             "voice_profile": "Voice profile",
@@ -2365,10 +2407,14 @@ def build_gradio_admin_blocks(
             gr.update(label=ui_value(language, "download_force")),
             gr.update(label=ui_value(language, "download_repo")),
             gr.update(label=ui_value(language, "download_speakers")),
+            gr.update(label=ui_value(language, "download_shared_repo")),
+            gr.update(label=ui_value(language, "download_shared_presets")),
             gr.update(label=ui_value(language, "download_activate")),
             gr.update(value=ui_value(language, "download_base")),
             gr.update(value=ui_value(language, "download_v2pro")),
             gr.update(value=ui_value(language, "download_demo")),
+            gr.update(value=ui_value(language, "download_extended_demo")),
+            gr.update(value=ui_value(language, "download_shared")),
             gr.update(value=ui_value(language, "refresh")),
             gr.update(value=ui_value(language, "download_stop")),
             gr.update(label=ui_value(language, "download_status")),
@@ -2404,6 +2450,61 @@ def build_gradio_admin_blocks(
         title_md = gr.Markdown(ui_copy("中文")[0])
         endpoint_md = gr.Markdown(ui_copy("中文")[1])
         language_radio = gr.Radio(["中文", "English"], value="中文", label=ui_value("中文", "language"))
+        with gr.Tab("已训练音色测试"):
+            trained_hint = gr.Markdown(ui_copy("中文")[2])
+            trained_text_input = gr.Textbox(label=ui_value("中文", "text"), lines=4)
+            with gr.Row():
+                voice_dropdown = gr.Dropdown(
+                    choices=voice_choices(),
+                    value=voice_choices()[0],
+                    label=ui_value("中文", "voice_profile"),
+                )
+                trained_text_lang = gr.Textbox(value="zh", label=ui_value("中文", "text_language"))
+                trained_speed = gr.Slider(0.25, 4.0, value=1.0, step=0.05, label=ui_value("中文", "speed"))
+            trained_synth_btn = gr.Button(ui_value("中文", "trained_button"))
+            trained_audio_output = gr.Audio(label=ui_value("中文", "output"), type="filepath")
+            trained_metrics_box = gr.Textbox(label=ui_value("中文", "rtf"), lines=4)
+            trained_synth_btn.click(
+                trained_synthesize_preview,
+                inputs=[
+                    trained_text_input,
+                    voice_dropdown,
+                    trained_text_lang,
+                    trained_speed,
+                ],
+                outputs=[trained_audio_output, trained_metrics_box],
+            )
+        with gr.Tab("声音克隆测试"):
+            clone_hint = gr.Markdown(ui_copy("中文")[3])
+            clone_text_input = gr.Textbox(label=ui_value("中文", "text"), lines=4)
+            clone_ref_audio_file = gr.Audio(type="filepath", label=ui_value("中文", "reference_upload"))
+            clone_prompt_text = gr.Textbox(label=ui_value("中文", "prompt_text"), lines=2)
+            with gr.Row():
+                clone_speaker = gr.Textbox(value="clone", label=ui_value("中文", "speaker"))
+                clone_text_lang = gr.Textbox(value="zh", label=ui_value("中文", "text_language"))
+                clone_prompt_lang = gr.Textbox(value="zh", label=ui_value("中文", "prompt_language"))
+                clone_speed = gr.Slider(0.25, 4.0, value=1.0, step=0.05, label=ui_value("中文", "speed"))
+            with gr.Row():
+                clone_gpt_input = gr.Textbox(value=str(DEFAULT_CLONE_GPT_WEIGHTS), label=ui_value("中文", "clone_gpt"))
+                clone_sovits_input = gr.Textbox(value=str(DEFAULT_CLONE_SOVITS_WEIGHTS), label=ui_value("中文", "clone_sovits"))
+            clone_synth_btn = gr.Button(ui_value("中文", "clone_button"))
+            clone_audio_output = gr.Audio(label=ui_value("中文", "output"), type="filepath")
+            clone_metrics_box = gr.Textbox(label=ui_value("中文", "rtf"), lines=4)
+            clone_synth_btn.click(
+                clone_synthesize_preview,
+                inputs=[
+                    clone_text_input,
+                    clone_speaker,
+                    clone_ref_audio_file,
+                    clone_prompt_text,
+                    clone_text_lang,
+                    clone_prompt_lang,
+                    clone_speed,
+                    clone_gpt_input,
+                    clone_sovits_input,
+                ],
+                outputs=[clone_audio_output, clone_metrics_box],
+            )
         with gr.Tab("API 状态"):
             status_box = gr.Code(value=status_text, language="json", label=ui_value("中文", "status"))
             with gr.Row():
@@ -2459,9 +2560,17 @@ def build_gradio_admin_blocks(
                 download_speakers = gr.Textbox(value=DEFAULT_DEMO_SPEAKERS, label=ui_value("中文", "download_speakers"))
                 download_activate = gr.Checkbox(value=True, label=ui_value("中文", "download_activate"))
             with gr.Row():
+                download_shared_repo = gr.Textbox(value=DEFAULT_SHARED_REPO_ID, label=ui_value("中文", "download_shared_repo"))
+                download_shared_presets = gr.Textbox(
+                    value=DEFAULT_SHARED_PRESETS,
+                    label=ui_value("中文", "download_shared_presets"),
+                )
+            with gr.Row():
                 download_base_btn = gr.Button(ui_value("中文", "download_base"))
                 download_v2pro_btn = gr.Button(ui_value("中文", "download_v2pro"))
                 download_demo_btn = gr.Button(ui_value("中文", "download_demo"))
+                download_extended_demo_btn = gr.Button(ui_value("中文", "download_extended_demo"))
+                download_shared_btn = gr.Button(ui_value("中文", "download_shared"))
                 download_refresh_btn = gr.Button(ui_value("中文", "refresh"))
                 download_stop_btn = gr.Button(ui_value("中文", "download_stop"))
             download_status_box = gr.Textbox(
@@ -2484,59 +2593,18 @@ def build_gradio_admin_blocks(
                 inputs=[download_source, download_repo, download_speakers, download_activate, download_force],
                 outputs=download_status_box,
             )
+            download_extended_demo_btn.click(
+                start_extended_demo_download,
+                inputs=[download_source, download_repo, download_activate, download_force],
+                outputs=download_status_box,
+            )
+            download_shared_btn.click(
+                start_shared_multispeaker_download,
+                inputs=[download_source, download_shared_repo, download_shared_presets, download_force],
+                outputs=download_status_box,
+            )
             download_refresh_btn.click(download_manager.status, outputs=download_status_box)
             download_stop_btn.click(download_manager.stop, outputs=download_status_box)
-        with gr.Tab("已训练音色测试"):
-            trained_hint = gr.Markdown(ui_copy("中文")[2])
-            voice_dropdown = gr.Dropdown(choices=voice_choices(), value=voice_choices()[0], label=ui_value("中文", "voice_profile"))
-            trained_text_input = gr.Textbox(label=ui_value("中文", "text"), lines=4)
-            with gr.Row():
-                trained_text_lang = gr.Textbox(value="zh", label=ui_value("中文", "text_language"))
-                trained_speed = gr.Slider(0.25, 4.0, value=1.0, step=0.05, label=ui_value("中文", "speed"))
-            trained_synth_btn = gr.Button(ui_value("中文", "trained_button"))
-            trained_audio_output = gr.Audio(label=ui_value("中文", "output"), type="filepath")
-            trained_metrics_box = gr.Textbox(label=ui_value("中文", "rtf"), lines=4)
-            trained_synth_btn.click(
-                trained_synthesize_preview,
-                inputs=[
-                    trained_text_input,
-                    voice_dropdown,
-                    trained_text_lang,
-                    trained_speed,
-                ],
-                outputs=[trained_audio_output, trained_metrics_box],
-            )
-        with gr.Tab("声音克隆测试"):
-            clone_hint = gr.Markdown(ui_copy("中文")[3])
-            clone_text_input = gr.Textbox(label=ui_value("中文", "text"), lines=4)
-            clone_speaker = gr.Textbox(value="clone", label=ui_value("中文", "speaker"))
-            with gr.Row():
-                clone_text_lang = gr.Textbox(value="zh", label=ui_value("中文", "text_language"))
-                clone_prompt_lang = gr.Textbox(value="zh", label=ui_value("中文", "prompt_language"))
-                clone_speed = gr.Slider(0.25, 4.0, value=1.0, step=0.05, label=ui_value("中文", "speed"))
-            clone_ref_audio_file = gr.Audio(type="filepath", label=ui_value("中文", "reference_upload"))
-            clone_prompt_text = gr.Textbox(label=ui_value("中文", "prompt_text"), lines=2)
-            with gr.Row():
-                clone_gpt_input = gr.Textbox(value=str(DEFAULT_CLONE_GPT_WEIGHTS), label=ui_value("中文", "clone_gpt"))
-                clone_sovits_input = gr.Textbox(value=str(DEFAULT_CLONE_SOVITS_WEIGHTS), label=ui_value("中文", "clone_sovits"))
-            clone_synth_btn = gr.Button(ui_value("中文", "clone_button"))
-            clone_audio_output = gr.Audio(label=ui_value("中文", "output"), type="filepath")
-            clone_metrics_box = gr.Textbox(label=ui_value("中文", "rtf"), lines=4)
-            clone_synth_btn.click(
-                clone_synthesize_preview,
-                inputs=[
-                    clone_text_input,
-                    clone_speaker,
-                    clone_ref_audio_file,
-                    clone_prompt_text,
-                    clone_text_lang,
-                    clone_prompt_lang,
-                    clone_speed,
-                    clone_gpt_input,
-                    clone_sovits_input,
-                ],
-                outputs=[clone_audio_output, clone_metrics_box],
-            )
         with gr.Tab("说话人"):
             profiles_box = gr.Code(value=profiles_text, language="json", label=ui_value("中文", "profiles"))
             voices_refresh_btn = gr.Button(ui_value("中文", "refresh_voices"))
@@ -2575,10 +2643,14 @@ def build_gradio_admin_blocks(
                 download_force,
                 download_repo,
                 download_speakers,
+                download_shared_repo,
+                download_shared_presets,
                 download_activate,
                 download_base_btn,
                 download_v2pro_btn,
                 download_demo_btn,
+                download_extended_demo_btn,
+                download_shared_btn,
                 download_refresh_btn,
                 download_stop_btn,
                 download_status_box,

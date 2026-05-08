@@ -35,6 +35,7 @@ Default speakers used by this repo:
 - Shape: shared language/work weights with many listed game characters.
 - Assets: model card says `GPT*` files are GPT weights and `SV*` files are
   SoVITS weights.
+- Local downloader presets: `genshin-en`, `genshin-ja`, `wuthering-cn`.
 - Compatibility: v2.
 - Caveat: the model card says it does not provide reference audio, so profiles
   need separate `ref_audio_path` and `prompt_text`.
