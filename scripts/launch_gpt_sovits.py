@@ -1974,6 +1974,8 @@ class ManagedGradioProcess:
         self.profiles_path = profiles_path
         self.log_level = log_level
         self.debug_runtime_output = debug_runtime_output
+        self.stdout_path = RUNTIME_LOG_ROOT / "admin-ui.out.log"
+        self.stderr_path = RUNTIME_LOG_ROOT / "admin-ui.err.log"
         self.process: Optional[subprocess.Popen] = None
 
     def is_running(self) -> bool:
@@ -2009,11 +2011,25 @@ class ManagedGradioProcess:
         if self.is_running():
             assert self.process is not None
             return f"Admin UI is already running with PID {self.process.pid}."
-        self.process = subprocess.Popen(self.command(), cwd=WORKSPACE_ROOT)
+        self.stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.stdout_path.open("a", encoding="utf-8") as stdout_file, self.stderr_path.open(
+            "a",
+            encoding="utf-8",
+        ) as stderr_file:
+            self.process = subprocess.Popen(
+                self.command(),
+                cwd=WORKSPACE_ROOT,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True,
+            )
         time.sleep(1)
         if self.process.poll() is not None:
             return f"Admin UI process exited immediately with code {self.process.returncode}."
-        return f"Started admin UI PID {self.process.pid} on port {self.port}, API={self.api_base}."
+        return (
+            f"Started admin UI PID {self.process.pid} on port {self.port}, API={self.api_base}. "
+            f"Logs: {self.stdout_path}, {self.stderr_path}"
+        )
 
     def stop(self) -> str:
         if not self.is_running():
