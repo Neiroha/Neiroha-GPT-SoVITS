@@ -96,6 +96,19 @@ does not synthesize fake speaker names from the checkpoint alone. The shared
 reference downloader can generate profiles such as `shared-genshin-en-furina`
 and `shared-genshin-ja-keqing`.
 
+The Gradio admin page also includes an `OpenAI Voice 配置` profile builder. It
+can register any combination of:
+
+- GPT weights path
+- SoVITS weights path
+- reference audio upload or path
+- prompt text matching the reference audio
+- prompt/text language
+
+The builder writes `profiles/voices.json`; because the FastAPI registry reads
+that file on each request, newly saved voices become visible through
+`GET /v1/audio/voices` without restarting the API.
+
 v2ProPlus clone mode uses these default local paths:
 
 ```text

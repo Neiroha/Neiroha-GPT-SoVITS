@@ -57,11 +57,12 @@ RUNTIME_LOG_ROOT = RUNTIME_ROOT / "logs"
 TEMP_ROOT = RUNTIME_ROOT / "temp"
 UPLOAD_ROOT = TEMP_ROOT / "uploads"
 OUTPUT_ROOT = RUNTIME_ROOT / "outputs"
+LOCAL_REFERENCE_ROOT = MODELS_ROOT / "reference-audio" / "local"
 DEFAULT_CONFIG_PATH = RUNTIME_CACHE_ROOT / "tts_infer.yaml"
 RUNTIME_EVENT_LOG_PATH = RUNTIME_LOG_ROOT / "api-events.jsonl"
 RUNTIME_DEBUG_LOG_PATH = RUNTIME_LOG_ROOT / "api-debug.log"
 
-for path in (RUNTIME_ROOT, RUNTIME_CACHE_ROOT, RUNTIME_LOG_ROOT, TEMP_ROOT, UPLOAD_ROOT, OUTPUT_ROOT):
+for path in (RUNTIME_ROOT, RUNTIME_CACHE_ROOT, RUNTIME_LOG_ROOT, TEMP_ROOT, UPLOAD_ROOT, OUTPUT_ROOT, LOCAL_REFERENCE_ROOT):
     path.mkdir(parents=True, exist_ok=True)
 
 os.environ.setdefault("TMPDIR", str(TEMP_ROOT))
@@ -209,6 +210,13 @@ def resolve_optional_path(raw_path: Optional[str], *, repo_dir: Path) -> Optiona
         return str(workspace_candidate.resolve())
     repo_candidate = repo_dir / candidate
     return str(repo_candidate.resolve())
+
+
+def profile_path_text(path: Path) -> str:
+    resolved = path.resolve()
+    with contextlib.suppress(ValueError):
+        return resolved.relative_to(WORKSPACE_ROOT.resolve()).as_posix()
+    return str(resolved)
 
 
 def extract_voice_id(voice_value: Any) -> str:
@@ -2220,6 +2228,151 @@ def build_gradio_admin_blocks(
             }
             return json.dumps(payload, ensure_ascii=False, indent=2)
 
+    def local_profiles_payload() -> list[dict[str, Any]]:
+        if not registry.profile_path.exists():
+            return []
+        data = json.loads(registry.profile_path.read_text(encoding="utf-8-sig"))
+        if isinstance(data, dict):
+            data = data.get("voices", [])
+        if not isinstance(data, list):
+            raise ValueError(f"Voice profile file must contain a list or voices object: {registry.profile_path}")
+        return [item for item in data if isinstance(item, dict)]
+
+    def write_local_profiles(profiles: list[dict[str, Any]]) -> None:
+        registry.profile_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"voices": profiles}
+        registry.profile_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def profile_editor_text() -> str:
+        try:
+            payload = {"profiles_path": str(registry.profile_path), "voices": local_profiles_payload()}
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            return f"ERROR: {exc}"
+
+    def refresh_voice_dropdowns(selected_voice: str = ""):
+        choices = voice_choices()
+        selected = selected_voice if selected_voice in choices else (choices[0] if choices else "default")
+        return gr.update(choices=choices, value=selected), gr.update(choices=choices, value=selected)
+
+    def resolve_profile_file(raw_path: str, field_name: str) -> Path:
+        resolved = resolve_existing_file(raw_path, repo_dir=registry.repo_dir, field_name=field_name, required=True)
+        return Path(resolved)
+
+    def save_profile_reference_audio(voice_id: str, ref_audio_file: Optional[str], ref_audio_path: str) -> Path:
+        if ref_audio_file:
+            source = Path(ref_audio_file)
+            suffix = source.suffix or ".wav"
+            target_dir = LOCAL_REFERENCE_ROOT / safe_filename_part(voice_id, "voice")
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / f"reference{suffix}"
+            counter = 1
+            while target.exists():
+                target = target_dir / f"reference_{counter}{suffix}"
+                counter += 1
+            shutil.copyfile(source, target)
+            return target.resolve()
+        return resolve_profile_file(ref_audio_path, "ref_audio_path")
+
+    def save_openai_voice_profile(
+        voice_id: str,
+        name: str,
+        model_type: str,
+        model_id: str,
+        model_name: str,
+        description: str,
+        ref_audio_file: Optional[str],
+        ref_audio_path: str,
+        prompt_text: str,
+        prompt_lang: str,
+        text_lang: str,
+        gpt_weights_path: str,
+        sovits_weights_path: str,
+    ):
+        cleaned_id = safe_filename_part(voice_id or name, "custom-voice")
+        if not cleaned_id:
+            return (
+                "ERROR: voice id is required.",
+                profile_editor_text(),
+                *refresh_voice_dropdowns(),
+                native_models_text(),
+                native_voices_text(),
+            )
+        prompt_text = strip_text(prompt_text)
+        if not prompt_text:
+            return (
+                "ERROR: prompt text is required and must match the reference audio.",
+                profile_editor_text(),
+                *refresh_voice_dropdowns(),
+                native_models_text(),
+                native_voices_text(),
+            )
+        try:
+            ref_path = save_profile_reference_audio(cleaned_id, ref_audio_file, ref_audio_path)
+            gpt_path = resolve_profile_file(gpt_weights_path, "gpt_weights_path")
+            sovits_path = resolve_profile_file(sovits_weights_path, "sovits_weights_path")
+            profile = {
+                "id": cleaned_id,
+                "name": strip_text(name) or cleaned_id,
+                "description": strip_text(description)
+                or f"OpenAI voice profile using {Path(gpt_path).name} and {Path(sovits_path).name}.",
+                "model_id": strip_text(model_id) or "custom-openai-voice",
+                "model_name": strip_text(model_name) or strip_text(model_id) or "Custom OpenAI Voice",
+                "model_type": strip_text(model_type) or "reference-profile",
+                "ref_audio_path": profile_path_text(ref_path),
+                "prompt_text": prompt_text,
+                "prompt_lang": strip_text(prompt_lang) or strip_text(text_lang) or "zh",
+                "text_lang": strip_text(text_lang) or strip_text(prompt_lang) or "zh",
+                "aux_ref_audio_paths": [],
+                "gpt_weights_path": profile_path_text(gpt_path),
+                "sovits_weights_path": profile_path_text(sovits_path),
+            }
+            profiles = local_profiles_payload()
+            by_id = {strip_text(item.get("id") or item.get("name")): item for item in profiles}
+            by_id[cleaned_id] = profile
+            write_local_profiles(list(by_id.values()))
+        except Exception as exc:
+            return (
+                f"ERROR: {exc}",
+                profile_editor_text(),
+                *refresh_voice_dropdowns(),
+                native_models_text(),
+                native_voices_text(),
+            )
+
+        return (
+            f"Saved OpenAI voice profile `{cleaned_id}` to {registry.profile_path}.",
+            profile_editor_text(),
+            *refresh_voice_dropdowns(cleaned_id),
+            native_models_text(),
+            native_voices_text(),
+        )
+
+    def delete_openai_voice_profile(voice_id: str):
+        target_id = strip_text(voice_id)
+        if not target_id:
+            return (
+                "ERROR: voice id is required.",
+                profile_editor_text(),
+                *refresh_voice_dropdowns(),
+                native_models_text(),
+                native_voices_text(),
+            )
+        profiles = local_profiles_payload()
+        kept = [item for item in profiles if strip_text(item.get("id") or item.get("name")) != target_id]
+        if len(kept) == len(profiles):
+            status = f"Voice profile `{target_id}` was not found."
+        else:
+            write_local_profiles(kept)
+            status = f"Deleted OpenAI voice profile `{target_id}` from {registry.profile_path}."
+        return (
+            status,
+            profile_editor_text(),
+            *refresh_voice_dropdowns(),
+            native_models_text(),
+            native_voices_text(),
+        )
+
     def native_models_text() -> str:
         try:
             response = requests.get(api_url("/gpt-sovits/models"), timeout=10)
@@ -2503,6 +2656,17 @@ def build_gradio_admin_blocks(
             "download_stop": "停止下载",
             "download_status": "下载状态 / 日志",
             "runtime_events": "运行事件 / RTF",
+            "profile_editor": "OpenAI Voice 配置器",
+            "profile_editor_hint": "把任意 GPT/SoVITS 权重和参考音频登记成 `/v1/audio/voices` 可见的 voice。",
+            "profile_id": "Voice ID",
+            "profile_name": "显示名称",
+            "profile_model_type": "模型类型",
+            "profile_model_id": "模型 ID",
+            "profile_model_name": "模型名称",
+            "profile_description": "描述",
+            "profile_save": "保存 / 更新 voice",
+            "profile_delete": "删除 voice",
+            "profile_json": "本地 profiles/voices.json",
             "voice_profile": "音色配置",
             "text": "文本",
             "text_language": "文本语言",
@@ -2514,6 +2678,7 @@ def build_gradio_admin_blocks(
             "speaker": "输出说话人名",
             "prompt_language": "参考音频语言",
             "reference_upload": "上传参考音频",
+            "reference_path": "参考音频路径",
             "prompt_text": "参考音频对应文本",
             "clone_gpt": "克隆 GPT 权重",
             "clone_sovits": "克隆 SoVITS 权重",
@@ -2562,6 +2727,17 @@ def build_gradio_admin_blocks(
             "download_stop": "Stop download",
             "download_status": "Download status / logs",
             "runtime_events": "Runtime events / RTF",
+            "profile_editor": "OpenAI Voice Profile Builder",
+            "profile_editor_hint": "Register any GPT/SoVITS weights plus reference audio as a `/v1/audio/voices` voice.",
+            "profile_id": "Voice ID",
+            "profile_name": "Display name",
+            "profile_model_type": "Model type",
+            "profile_model_id": "Model ID",
+            "profile_model_name": "Model name",
+            "profile_description": "Description",
+            "profile_save": "Save / update voice",
+            "profile_delete": "Delete voice",
+            "profile_json": "Local profiles/voices.json",
             "voice_profile": "Voice profile",
             "text": "Text",
             "text_language": "Text language",
@@ -2573,6 +2749,7 @@ def build_gradio_admin_blocks(
             "speaker": "Output speaker name",
             "prompt_language": "Prompt language",
             "reference_upload": "Reference audio upload",
+            "reference_path": "Reference audio path",
             "prompt_text": "Prompt text matching reference audio",
             "clone_gpt": "Clone GPT weights",
             "clone_sovits": "Clone SoVITS weights",
@@ -2635,6 +2812,23 @@ def build_gradio_admin_blocks(
             gr.update(value=ui_value(language, "download_stop")),
             gr.update(label=ui_value(language, "download_status")),
             gr.update(label=ui_value(language, "runtime_events")),
+            ui_value(language, "profile_editor_hint"),
+            gr.update(label=ui_value(language, "profile_id")),
+            gr.update(label=ui_value(language, "profile_name")),
+            gr.update(label=ui_value(language, "profile_model_type")),
+            gr.update(label=ui_value(language, "profile_model_id")),
+            gr.update(label=ui_value(language, "profile_model_name")),
+            gr.update(label=ui_value(language, "profile_description")),
+            gr.update(label=ui_value(language, "reference_upload")),
+            gr.update(label=ui_value(language, "reference_path")),
+            gr.update(label=ui_value(language, "prompt_text")),
+            gr.update(label=ui_value(language, "prompt_language")),
+            gr.update(label=ui_value(language, "text_language")),
+            gr.update(label=ui_value(language, "gpt_weights")),
+            gr.update(label=ui_value(language, "sovits_weights")),
+            gr.update(value=ui_value(language, "profile_save")),
+            gr.update(value=ui_value(language, "profile_delete")),
+            gr.update(label=ui_value(language, "profile_json")),
             ui_value(language, "trained_hint"),
             gr.update(label=ui_value(language, "voice_profile")),
             gr.update(label=ui_value(language, "text")),
@@ -2868,6 +3062,72 @@ def build_gradio_admin_blocks(
                 lambda: (native_models_text(), native_voices_text()),
                 outputs=[native_models_box, native_voices_box],
             )
+        with gr.Tab("OpenAI Voice 配置"):
+            profile_editor_hint = gr.Markdown(ui_value("中文", "profile_editor_hint"))
+            profile_status_box = gr.Textbox(label=ui_value("中文", "profile_editor"), lines=2)
+            with gr.Row():
+                profile_id_input = gr.Textbox(value="custom-voice", label=ui_value("中文", "profile_id"))
+                profile_name_input = gr.Textbox(value="Custom Voice", label=ui_value("中文", "profile_name"))
+                profile_model_type = gr.Dropdown(
+                    choices=["reference-profile", "trained", "shared-trained"],
+                    value="reference-profile",
+                    label=ui_value("中文", "profile_model_type"),
+                )
+            with gr.Row():
+                profile_model_id = gr.Textbox(value="custom-openai-voice", label=ui_value("中文", "profile_model_id"))
+                profile_model_name = gr.Textbox(value="Custom OpenAI Voice", label=ui_value("中文", "profile_model_name"))
+            profile_description = gr.Textbox(label=ui_value("中文", "profile_description"), lines=2)
+            profile_ref_audio_file = gr.Audio(type="filepath", label=ui_value("中文", "reference_upload"))
+            profile_ref_audio_path = gr.Textbox(label=ui_value("中文", "reference_path"))
+            profile_prompt_text = gr.Textbox(label=ui_value("中文", "prompt_text"), lines=2)
+            with gr.Row():
+                profile_prompt_lang = gr.Textbox(value="zh", label=ui_value("中文", "prompt_language"))
+                profile_text_lang = gr.Textbox(value="zh", label=ui_value("中文", "text_language"))
+            with gr.Row():
+                profile_gpt_weights = gr.Textbox(value=str(DEFAULT_CLONE_GPT_WEIGHTS), label=ui_value("中文", "gpt_weights"))
+                profile_sovits_weights = gr.Textbox(value=str(DEFAULT_CLONE_SOVITS_WEIGHTS), label=ui_value("中文", "sovits_weights"))
+            with gr.Row():
+                profile_save_btn = gr.Button(ui_value("中文", "profile_save"))
+                profile_delete_btn = gr.Button(ui_value("中文", "profile_delete"))
+            profile_json_box = gr.Code(value=profile_editor_text, language="json", label=ui_value("中文", "profile_json"))
+            profile_save_btn.click(
+                save_openai_voice_profile,
+                inputs=[
+                    profile_id_input,
+                    profile_name_input,
+                    profile_model_type,
+                    profile_model_id,
+                    profile_model_name,
+                    profile_description,
+                    profile_ref_audio_file,
+                    profile_ref_audio_path,
+                    profile_prompt_text,
+                    profile_prompt_lang,
+                    profile_text_lang,
+                    profile_gpt_weights,
+                    profile_sovits_weights,
+                ],
+                outputs=[
+                    profile_status_box,
+                    profile_json_box,
+                    voice_dropdown,
+                    process_voice,
+                    native_models_box,
+                    native_voices_box,
+                ],
+            )
+            profile_delete_btn.click(
+                delete_openai_voice_profile,
+                inputs=[profile_id_input],
+                outputs=[
+                    profile_status_box,
+                    profile_json_box,
+                    voice_dropdown,
+                    process_voice,
+                    native_models_box,
+                    native_voices_box,
+                ],
+            )
 
         language_radio.change(
             ui_updates,
@@ -2911,6 +3171,23 @@ def build_gradio_admin_blocks(
                 download_stop_btn,
                 download_status_box,
                 runtime_events_box,
+                profile_editor_hint,
+                profile_id_input,
+                profile_name_input,
+                profile_model_type,
+                profile_model_id,
+                profile_model_name,
+                profile_description,
+                profile_ref_audio_file,
+                profile_ref_audio_path,
+                profile_prompt_text,
+                profile_prompt_lang,
+                profile_text_lang,
+                profile_gpt_weights,
+                profile_sovits_weights,
+                profile_save_btn,
+                profile_delete_btn,
+                profile_json_box,
                 trained_hint,
                 voice_dropdown,
                 trained_text_input,

@@ -66,6 +66,12 @@ Copy-Item profiles/voices.example.json profiles/voices.json
 
 然后把 `ref_audio_path` 和 `prompt_text` 改成真实数据。
 
+也可以直接在 Gradio 管理页的 `OpenAI Voice 配置` tab 里新增或更新 voice：
+选择 v2ProPlus 基座权重、AI-Hobbyist 共享权重，或任意下载好的 GPT/SoVITS
+权重，再上传参考音频并填写对应文本。保存后会写入本地
+`profiles/voices.json`，随后 `/v1/audio/voices` 和 `/v1/audio/speech`
+会按这个 voice 提供 OpenAI TTS 风格服务。
+
 如果使用原神 demo 下载任务，它会额外生成
 `profiles/voices.genshin.example.json`，并把同样内容写到被 git 忽略的
 `profiles/voices.json`。默认包含 `genshin-paimon`、`genshin-keqing`、`genshin-klee`
@@ -130,6 +136,9 @@ Neiroha 里已经有 `gptSovits` adapter：
   upstream 推理 API 没有单独的 speaker id table，仍然靠 `ref_audio_path` +
   `prompt_text` 来指定具体音色；本仓库会把“共享权重 + 每个角色参考音频”展开成
   OpenAI voice profiles。
+- 自定义 OpenAI voice：在管理页把“基座或训练权重 + 参考音频 + 参考文本”保存成
+  profile。这样 v2ProPlus 基座模型也可以被包装成多个可选 voice，但这些 voice 的
+  本质仍然是 reference-conditioned，并不是 checkpoint 内置 speaker id。
 - 声音克隆：使用 v2ProPlus 基座权重，加参考音频和对应文本。原生接口是 `POST /gpt-sovits/clone` 或上传版 `POST /gpt-sovits/clone/upload`。
 
 v2ProPlus 克隆基座的本地路径：
