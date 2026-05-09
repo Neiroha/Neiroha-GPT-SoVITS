@@ -48,6 +48,9 @@ DEFAULT_DEMO_SPEAKERS = "派蒙,刻晴,可莉"
 DEFAULT_EXTENDED_DEMO_SPEAKERS = "派蒙,刻晴,可莉,胡桃,甘雨,雷电将军,纳西妲,神里绫华,八重神子,钟离"
 DEFAULT_SHARED_REPO_ID = "AI-Hobbyist/GPT-SoVits-V2-models"
 DEFAULT_SHARED_PRESETS = "genshin-en,genshin-ja,wuthering-cn"
+DEFAULT_SHARED_REFERENCE_REPO_ID = "AquaV/genshin-voices-separated"
+DEFAULT_SHARED_REFERENCE_CHARACTERS = "Furina,Keqing,Klee,Zhongli,Nahida"
+DEFAULT_SHARED_REFERENCE_LANGUAGES = "English(US),Japanese"
 RUNTIME_ROOT = WORKSPACE_ROOT / "runtime"
 RUNTIME_CACHE_ROOT = RUNTIME_ROOT / "cache"
 RUNTIME_LOG_ROOT = RUNTIME_ROOT / "logs"
@@ -55,6 +58,8 @@ TEMP_ROOT = RUNTIME_ROOT / "temp"
 UPLOAD_ROOT = TEMP_ROOT / "uploads"
 OUTPUT_ROOT = RUNTIME_ROOT / "outputs"
 DEFAULT_CONFIG_PATH = RUNTIME_CACHE_ROOT / "tts_infer.yaml"
+RUNTIME_EVENT_LOG_PATH = RUNTIME_LOG_ROOT / "api-events.jsonl"
+RUNTIME_DEBUG_LOG_PATH = RUNTIME_LOG_ROOT / "api-debug.log"
 
 for path in (RUNTIME_ROOT, RUNTIME_CACHE_ROOT, RUNTIME_LOG_ROOT, TEMP_ROOT, UPLOAD_ROOT, OUTPUT_ROOT):
     path.mkdir(parents=True, exist_ok=True)
@@ -78,6 +83,51 @@ CONTENT_TYPES = {
     "ogg": "audio/ogg",
     "raw": "application/octet-stream",
 }
+
+
+class RuntimeEventLog:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = threading.RLock()
+
+    def append(self, event: str, **fields: Any) -> None:
+        payload = {
+            "time": dt.datetime.now().isoformat(timespec="seconds"),
+            "event": event,
+            **fields,
+        }
+        with self.lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def tail(self, limit: int = 80) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        with self.lock:
+            lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
+        events = []
+        for line in lines[-max(limit, 1) :]:
+            with contextlib.suppress(json.JSONDecodeError):
+                item = json.loads(line)
+                if isinstance(item, dict):
+                    events.append(item)
+        return events
+
+
+RUNTIME_EVENTS = RuntimeEventLog(RUNTIME_EVENT_LOG_PATH)
+
+
+@contextlib.contextmanager
+def runtime_output_scope(debug_enabled: bool):
+    target = RUNTIME_DEBUG_LOG_PATH if debug_enabled else Path(os.devnull)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if debug_enabled else "w"
+    with target.open(mode, encoding="utf-8", errors="replace") as stream:
+        if debug_enabled:
+            stream.write(f"\n--- {dt.datetime.now().isoformat(timespec='seconds')} ---\n")
+        with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+            yield
 
 
 def strip_text(value: Any) -> str:
@@ -342,6 +392,11 @@ class VoiceProfile:
             "name": self.name,
             "object": "voice",
             "description": self.description,
+            "model_id": self.model_id,
+            "model_name": self.model_name,
+            "model_type": self.model_type,
+            "text_lang": self.text_lang,
+            "prompt_lang": self.prompt_lang,
         }
 
     def to_speaker(self) -> dict[str, str]:
@@ -512,11 +567,13 @@ class GPTSoVITSRuntime:
         config_path: Path,
         device: str = "config",
         is_half: Optional[bool] = None,
+        debug_runtime_output: bool = False,
     ) -> None:
         self.repo_dir = repo_dir.resolve()
         self.config_path = config_path.resolve()
         self.device_override = device
         self.is_half_override = is_half
+        self.debug_runtime_output = debug_runtime_output
         self.lock = threading.RLock()
         self.tts_config = None
         self.tts_pipeline = None
@@ -573,12 +630,24 @@ class GPTSoVITSRuntime:
             from GPT_SoVITS.TTS_infer_pack.text_segmentation_method import get_method_names
 
             self.tts_config = self._build_config(config_path)
-            LOGGER.info("Loading GPT-SoVITS with config=%s", self.tts_config.configs_path)
-            self.tts_pipeline = TTS(self.tts_config)
+            started_at = time.perf_counter()
+            RUNTIME_EVENTS.append("model_load_start", config_path=str(self.tts_config.configs_path))
+            with runtime_output_scope(self.debug_runtime_output):
+                self.tts_pipeline = TTS(self.tts_config)
             self.cut_method_names = get_method_names()
             self.current_gpt_weights_path = str(self.tts_config.t2s_weights_path)
             self.current_sovits_weights_path = str(self.tts_config.vits_weights_path)
-            return self.status()
+            status = self.status()
+            RUNTIME_EVENTS.append(
+                "model_load_complete",
+                elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                config_path=str(self.tts_config.configs_path),
+                gpt_weights_path=self.current_gpt_weights_path,
+                sovits_weights_path=self.current_sovits_weights_path,
+                device=status.get("device"),
+                is_half=status.get("is_half"),
+            )
+            return status
 
     def unload(self) -> dict[str, Any]:
         with self.lock:
@@ -592,6 +661,7 @@ class GPTSoVITSRuntime:
                     torch.cuda.empty_cache()
             except Exception:
                 LOGGER.debug("Unable to empty CUDA cache after unload.", exc_info=True)
+            RUNTIME_EVENTS.append("model_unload")
             return self.status()
 
     def reload(self, config_path: Optional[str] = None) -> dict[str, Any]:
@@ -608,10 +678,19 @@ class GPTSoVITSRuntime:
     def set_gpt_weights(self, weights_path: str) -> dict[str, Any]:
         resolved = resolve_existing_file(weights_path, repo_dir=self.repo_dir, field_name="gpt_weights_path", required=True)
         with self.lock:
+            started_at = time.perf_counter()
+            RUNTIME_EVENTS.append("gpt_weights_load_start", weights_path=resolved)
             pipeline = self.get_or_load()
-            pipeline.init_t2s_weights(resolved)
+            with runtime_output_scope(self.debug_runtime_output):
+                pipeline.init_t2s_weights(resolved)
             self.current_gpt_weights_path = resolved
-            return self.status()
+            status = self.status()
+            RUNTIME_EVENTS.append(
+                "gpt_weights_load_complete",
+                elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                weights_path=resolved,
+            )
+            return status
 
     def set_sovits_weights(self, weights_path: str) -> dict[str, Any]:
         resolved = resolve_existing_file(
@@ -621,10 +700,19 @@ class GPTSoVITSRuntime:
             required=True,
         )
         with self.lock:
+            started_at = time.perf_counter()
+            RUNTIME_EVENTS.append("sovits_weights_load_start", weights_path=resolved)
             pipeline = self.get_or_load()
-            pipeline.init_vits_weights(resolved)
+            with runtime_output_scope(self.debug_runtime_output):
+                pipeline.init_vits_weights(resolved)
             self.current_sovits_weights_path = resolved
-            return self.status()
+            status = self.status()
+            RUNTIME_EVENTS.append(
+                "sovits_weights_load_complete",
+                elapsed_seconds=round(time.perf_counter() - started_at, 3),
+                weights_path=resolved,
+            )
+            return status
 
     def set_refer_audio(self, refer_audio_path: str) -> dict[str, Any]:
         resolved = resolve_existing_file(
@@ -635,7 +723,8 @@ class GPTSoVITSRuntime:
         )
         with self.lock:
             pipeline = self.get_or_load()
-            pipeline.set_ref_audio(resolved)
+            with runtime_output_scope(self.debug_runtime_output):
+                pipeline.set_ref_audio(resolved)
             return {"message": "success", "refer_audio_path": resolved}
 
     def apply_profile_weights(self, profile: Optional[VoiceProfile]) -> None:
@@ -731,16 +820,18 @@ class GPTSoVITSRuntime:
                 request["streaming_mode"] = False
                 request["return_fragment"] = False
                 request["fixed_length_chunk"] = False
-            generator = pipeline.run(request)
-            return next(generator)
+            with runtime_output_scope(self.debug_runtime_output):
+                generator = pipeline.run(request)
+                return next(generator)
 
     def synthesize_stream(self, request: dict[str, Any]) -> Generator[tuple[int, np.ndarray], None, None]:
         with self.lock:
             pipeline = self.get_or_load()
             request = self.validate_request(request)
             request, _ = self.normalize_streaming_mode(request)
-            for item in pipeline.run(request):
-                yield item
+            with runtime_output_scope(self.debug_runtime_output):
+                for item in pipeline.run(request):
+                    yield item
 
     def status(self) -> dict[str, Any]:
         config = self.tts_config
@@ -953,7 +1044,7 @@ def native_model_catalog(registry: VoiceRegistry) -> list[dict[str, Any]]:
             {
                 "id": model_id,
                 "object": "gpt_sovits.model",
-                "type": "trained",
+                "type": profile.model_type or "trained",
                 "name": model_name,
                 "voices": [],
             },
@@ -1027,7 +1118,7 @@ def streaming_audio_response(
 
 
 def log_rtf(
-    enabled: bool,
+    terminal_enabled: bool,
     *,
     mode: str,
     speaker: str,
@@ -1039,7 +1130,15 @@ def log_rtf(
     duration = len(audio_data) / sample_rate if sample_rate else 0.0
     rtf = elapsed / duration if duration > 0 else 0.0
     metrics = {"audio_seconds": duration, "elapsed_seconds": elapsed, "rtf": rtf}
-    if enabled:
+    RUNTIME_EVENTS.append(
+        "synthesis_complete",
+        mode=mode,
+        speaker=speaker,
+        audio_seconds=round(duration, 3),
+        elapsed_seconds=round(elapsed, 3),
+        rtf=round(rtf, 3),
+    )
+    if terminal_enabled:
         LOGGER.info(
             "TTS performance mode=%s speaker=%s audio=%.3fs elapsed=%.3fs rtf=%.3f",
             mode,
@@ -1082,10 +1181,11 @@ def normalize_clone_reference_audio(ref_audio_path: str, *, repo_dir: Path) -> t
         normalized_path = tmp.name
     sf.write(normalized_path, normalized, sample_rate)
     normalized_seconds = len(normalized) / sample_rate
-    LOGGER.info(
-        "Normalized clone reference audio from %.3fs to %.3fs without modifying upstream GPT-SoVITS.",
-        original_seconds,
-        normalized_seconds,
+    RUNTIME_EVENTS.append(
+        "clone_reference_normalized",
+        original_seconds=round(original_seconds, 3),
+        normalized_seconds=round(normalized_seconds, 3),
+        path=normalized_path,
     )
     return normalized_path, normalized_path
 
@@ -1103,7 +1203,7 @@ def create_api_app(
     registry: VoiceRegistry,
     *,
     default_voice_id: str = "",
-    rtf_log: bool = True,
+    rtf_log: bool = False,
 ) -> FastAPI:
     app = FastAPI(
         title="Neiroha GPT-SoVITS Launcher",
@@ -1216,6 +1316,12 @@ def create_api_app(
                 "long_audio": "trim from start",
                 "normalized_seconds": [CLONE_REFERENCE_MIN_SECONDS, CLONE_REFERENCE_MAX_SECONDS],
             },
+            "logging": {
+                "runtime_events": "/gpt-sovits/events",
+                "event_log_path": str(RUNTIME_EVENT_LOG_PATH),
+                "raw_runtime_output_default": "suppressed",
+                "raw_runtime_output_debug_log": str(RUNTIME_DEBUG_LOG_PATH),
+            },
         }
 
     @app.get("/speakers")
@@ -1248,6 +1354,14 @@ def create_api_app(
                 "set_gpt_weights": "/set_gpt_weights",
                 "set_sovits_weights": "/set_sovits_weights",
             },
+        }
+
+    @app.get("/gpt-sovits/events")
+    def runtime_events(limit: int = Query(80, ge=1, le=500)):
+        return {
+            "object": "list",
+            "path": str(RUNTIME_EVENT_LOG_PATH),
+            "data": RUNTIME_EVENTS.tail(limit),
         }
 
     @app.post("/v1/audio/speech")
@@ -1726,7 +1840,8 @@ class ManagedApiProcess:
         is_half: Optional[bool],
         default_voice_id: str,
         log_level: str,
-        rtf_log: bool,
+        terminal_rtf_log: bool,
+        debug_runtime_output: bool,
     ) -> None:
         self.api_host = api_host
         self.api_port = api_port
@@ -1737,7 +1852,8 @@ class ManagedApiProcess:
         self.is_half = is_half
         self.default_voice_id = default_voice_id
         self.log_level = log_level
-        self.rtf_log = rtf_log
+        self.terminal_rtf_log = terminal_rtf_log
+        self.debug_runtime_output = debug_runtime_output
         self.process: Optional[subprocess.Popen] = None
 
     def is_running(self) -> bool:
@@ -1792,8 +1908,10 @@ class ManagedApiProcess:
             command.append("--half")
         elif self.is_half is False:
             command.append("--no-half")
-        if not self.rtf_log:
-            command.append("--no-rtf-log")
+        if self.terminal_rtf_log:
+            command.append("--rtf-log")
+        if self.debug_runtime_output:
+            command.append("--debug-runtime-output")
         return command
 
     def start(self, *, default_voice_id: str = "", preload_model: bool = False) -> str:
@@ -1846,6 +1964,7 @@ class ManagedGradioProcess:
         config_path: Path,
         profiles_path: Path,
         log_level: str,
+        debug_runtime_output: bool,
     ) -> None:
         self.host = host
         self.port = port
@@ -1854,13 +1973,14 @@ class ManagedGradioProcess:
         self.config_path = config_path
         self.profiles_path = profiles_path
         self.log_level = log_level
+        self.debug_runtime_output = debug_runtime_output
         self.process: Optional[subprocess.Popen] = None
 
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
     def command(self) -> list[str]:
-        return [
+        command = [
             sys.executable,
             str(Path(__file__).resolve()),
             "--mode",
@@ -1880,6 +2000,10 @@ class ManagedGradioProcess:
             "--log-level",
             self.log_level,
         ]
+        if self.debug_runtime_output:
+            command.append("--debug-runtime-output")
+            command.append("--rtf-log")
+        return command
 
     def start(self) -> str:
         if self.is_running():
@@ -2096,6 +2220,40 @@ def build_gradio_admin_blocks(
         except Exception as exc:
             return f"ERROR: {exc}"
 
+    def runtime_events_text() -> str:
+        try:
+            response = requests.get(api_url("/gpt-sovits/events"), params={"limit": 120}, timeout=10)
+            response.raise_for_status()
+            data = response.json().get("data", [])
+        except Exception as exc:
+            return f"ERROR: {exc}"
+        if not data:
+            return "No runtime events yet."
+        lines = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            event = item.get("event", "event")
+            when = item.get("time", "")
+            if event == "synthesis_complete":
+                lines.append(
+                    f"{when} synthesis mode={item.get('mode')} speaker={item.get('speaker')} "
+                    f"audio={item.get('audio_seconds')}s elapsed={item.get('elapsed_seconds')}s "
+                    f"rtf={item.get('rtf')}"
+                )
+            elif event.endswith("_complete") and "elapsed_seconds" in item:
+                detail = item.get("weights_path") or item.get("config_path") or item.get("sovits_weights_path") or ""
+                lines.append(f"{when} {event} elapsed={item.get('elapsed_seconds')}s {detail}")
+            elif event == "clone_reference_normalized":
+                lines.append(
+                    f"{when} clone_reference_normalized "
+                    f"{item.get('original_seconds')}s -> {item.get('normalized_seconds')}s"
+                )
+            else:
+                detail = {key: value for key, value in item.items() if key not in {"time", "event"}}
+                lines.append(f"{when} {event} {json.dumps(detail, ensure_ascii=False)}")
+        return "\n".join(lines[-120:])
+
     def force_arg(force: bool) -> list[str]:
         return ["--force"] if force else []
 
@@ -2163,6 +2321,34 @@ def build_gradio_admin_blocks(
                 *force_arg(force),
             ],
         )
+
+    def start_shared_reference_download(
+        source: str,
+        repo_id: str,
+        reference_repo_id: str,
+        characters: str,
+        languages: str,
+        activate: bool,
+        force: bool,
+    ) -> str:
+        args = [
+            "--source",
+            source or DEFAULT_DOWNLOAD_SOURCE,
+            "--skip-base-assets",
+            "--shared-reference-demo",
+            "--shared-repo-id",
+            strip_text(repo_id) or DEFAULT_SHARED_REPO_ID,
+            "--shared-reference-repo-id",
+            strip_text(reference_repo_id) or DEFAULT_SHARED_REFERENCE_REPO_ID,
+            "--shared-reference-characters",
+            strip_text(characters) or DEFAULT_SHARED_REFERENCE_CHARACTERS,
+            "--shared-reference-languages",
+            strip_text(languages) or DEFAULT_SHARED_REFERENCE_LANGUAGES,
+            *force_arg(force),
+        ]
+        if activate:
+            args.append("--activate-voices")
+        return download_manager.start("shared reference voices", args)
 
     def audio_file_from_response(response: requests.Response, speaker: str) -> str:
         output_header = strip_text(response.headers.get("X-Neiroha-Output-Path"))
@@ -2288,14 +2474,19 @@ def build_gradio_admin_blocks(
             "download_speakers": "示例说话人",
             "download_shared_repo": "共享权重仓库",
             "download_shared_presets": "共享权重预设",
+            "download_reference_repo": "参考音频数据集",
+            "download_reference_characters": "共享参考音频角色",
+            "download_reference_languages": "共享参考音频语言",
             "download_activate": "下载后激活 voices.json",
             "download_base": "下载预训练基座",
             "download_v2pro": "下载 v2ProPlus 克隆基座",
             "download_demo": "下载 3 角色 demo",
             "download_extended_demo": "下载扩展多角色 voices",
             "download_shared": "下载共享多说话人权重",
+            "download_shared_refs": "下载共享参考音频并生成 voices",
             "download_stop": "停止下载",
             "download_status": "下载状态 / 日志",
+            "runtime_events": "运行事件 / RTF",
             "voice_profile": "音色配置",
             "text": "文本",
             "text_language": "文本语言",
@@ -2342,14 +2533,19 @@ def build_gradio_admin_blocks(
             "download_speakers": "Demo speakers",
             "download_shared_repo": "Shared-weights repo",
             "download_shared_presets": "Shared presets",
+            "download_reference_repo": "Reference audio dataset",
+            "download_reference_characters": "Shared reference characters",
+            "download_reference_languages": "Shared reference languages",
             "download_activate": "Activate voices.json after download",
             "download_base": "Download pretrained base",
             "download_v2pro": "Download v2ProPlus clone base",
             "download_demo": "Download 3-role demo",
             "download_extended_demo": "Download extended voices",
             "download_shared": "Download shared multi-speaker weights",
+            "download_shared_refs": "Download shared refs and generate voices",
             "download_stop": "Stop download",
             "download_status": "Download status / logs",
+            "runtime_events": "Runtime events / RTF",
             "voice_profile": "Voice profile",
             "text": "Text",
             "text_language": "Text language",
@@ -2409,15 +2605,20 @@ def build_gradio_admin_blocks(
             gr.update(label=ui_value(language, "download_speakers")),
             gr.update(label=ui_value(language, "download_shared_repo")),
             gr.update(label=ui_value(language, "download_shared_presets")),
+            gr.update(label=ui_value(language, "download_reference_repo")),
+            gr.update(label=ui_value(language, "download_reference_characters")),
+            gr.update(label=ui_value(language, "download_reference_languages")),
             gr.update(label=ui_value(language, "download_activate")),
             gr.update(value=ui_value(language, "download_base")),
             gr.update(value=ui_value(language, "download_v2pro")),
             gr.update(value=ui_value(language, "download_demo")),
             gr.update(value=ui_value(language, "download_extended_demo")),
             gr.update(value=ui_value(language, "download_shared")),
+            gr.update(value=ui_value(language, "download_shared_refs")),
             gr.update(value=ui_value(language, "refresh")),
             gr.update(value=ui_value(language, "download_stop")),
             gr.update(label=ui_value(language, "download_status")),
+            gr.update(label=ui_value(language, "runtime_events")),
             ui_value(language, "trained_hint"),
             gr.update(label=ui_value(language, "voice_profile")),
             gr.update(label=ui_value(language, "text")),
@@ -2512,6 +2713,14 @@ def build_gradio_admin_blocks(
                 unload_btn = gr.Button(ui_value("中文", "unload"))
             refresh_btn.click(status_text, outputs=status_box)
             unload_btn.click(unload_model, outputs=status_box)
+        with gr.Tab("运行事件"):
+            runtime_events_box = gr.Textbox(
+                value=runtime_events_text,
+                label=ui_value("中文", "runtime_events"),
+                lines=18,
+            )
+            runtime_events_refresh_btn = gr.Button(ui_value("中文", "refresh"))
+            runtime_events_refresh_btn.click(runtime_events_text, outputs=runtime_events_box)
         with gr.Tab("API 进程"):
             process_box = gr.Textbox(value=managed_status_text, label=ui_value("中文", "process"))
             process_voice = gr.Dropdown(choices=voice_choices(), value=voice_choices()[0], label=ui_value("中文", "default_voice"))
@@ -2566,11 +2775,25 @@ def build_gradio_admin_blocks(
                     label=ui_value("中文", "download_shared_presets"),
                 )
             with gr.Row():
+                download_reference_repo = gr.Textbox(
+                    value=DEFAULT_SHARED_REFERENCE_REPO_ID,
+                    label=ui_value("中文", "download_reference_repo"),
+                )
+                download_reference_characters = gr.Textbox(
+                    value=DEFAULT_SHARED_REFERENCE_CHARACTERS,
+                    label=ui_value("中文", "download_reference_characters"),
+                )
+                download_reference_languages = gr.Textbox(
+                    value=DEFAULT_SHARED_REFERENCE_LANGUAGES,
+                    label=ui_value("中文", "download_reference_languages"),
+                )
+            with gr.Row():
                 download_base_btn = gr.Button(ui_value("中文", "download_base"))
                 download_v2pro_btn = gr.Button(ui_value("中文", "download_v2pro"))
                 download_demo_btn = gr.Button(ui_value("中文", "download_demo"))
                 download_extended_demo_btn = gr.Button(ui_value("中文", "download_extended_demo"))
                 download_shared_btn = gr.Button(ui_value("中文", "download_shared"))
+                download_shared_refs_btn = gr.Button(ui_value("中文", "download_shared_refs"))
                 download_refresh_btn = gr.Button(ui_value("中文", "refresh"))
                 download_stop_btn = gr.Button(ui_value("中文", "download_stop"))
             download_status_box = gr.Textbox(
@@ -2601,6 +2824,19 @@ def build_gradio_admin_blocks(
             download_shared_btn.click(
                 start_shared_multispeaker_download,
                 inputs=[download_source, download_shared_repo, download_shared_presets, download_force],
+                outputs=download_status_box,
+            )
+            download_shared_refs_btn.click(
+                start_shared_reference_download,
+                inputs=[
+                    download_source,
+                    download_shared_repo,
+                    download_reference_repo,
+                    download_reference_characters,
+                    download_reference_languages,
+                    download_activate,
+                    download_force,
+                ],
                 outputs=download_status_box,
             )
             download_refresh_btn.click(download_manager.status, outputs=download_status_box)
@@ -2645,15 +2881,20 @@ def build_gradio_admin_blocks(
                 download_speakers,
                 download_shared_repo,
                 download_shared_presets,
+                download_reference_repo,
+                download_reference_characters,
+                download_reference_languages,
                 download_activate,
                 download_base_btn,
                 download_v2pro_btn,
                 download_demo_btn,
                 download_extended_demo_btn,
                 download_shared_btn,
+                download_shared_refs_btn,
                 download_refresh_btn,
                 download_stop_btn,
                 download_status_box,
+                runtime_events_box,
                 trained_hint,
                 voice_dropdown,
                 trained_text_input,
@@ -2707,10 +2948,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradio-path", default="/admin")
     parser.add_argument("--log-level", default="info")
     parser.add_argument(
+        "--rtf-log",
+        action="store_true",
+        default=os.environ.get("NEIROHA_GPT_SOVITS_RTF_LOG", "0").lower() in {"1", "true", "yes"},
+        help="Also print RTF performance lines to the FastAPI terminal. Headers and admin events are always kept.",
+    )
+    parser.add_argument(
         "--no-rtf-log",
         action="store_true",
-        default=os.environ.get("NEIROHA_GPT_SOVITS_RTF_LOG", "1").lower() in {"0", "false", "no"},
-        help="Disable terminal RTF performance logs for non-streaming synthesis.",
+        help="Compatibility flag: keep terminal RTF logs disabled.",
+    )
+    parser.add_argument(
+        "--debug-runtime-output",
+        action="store_true",
+        default=os.environ.get("NEIROHA_GPT_SOVITS_DEBUG_RUNTIME_OUTPUT", "0").lower() in {"1", "true", "yes"},
+        help=f"Capture raw GPT-SoVITS stdout/stderr in {RUNTIME_DEBUG_LOG_PATH} instead of suppressing it.",
     )
     return parser.parse_args()
 
@@ -2752,12 +3004,14 @@ def main() -> None:
     args = parse_args()
     port = resolve_port(args.mode, args.port)
     is_half = True if args.half else False if args.no_half else None
+    terminal_rtf_log = bool(args.rtf_log and not args.no_rtf_log)
 
     runtime = GPTSoVITSRuntime(
         repo_dir=args.repo_dir,
         config_path=args.config,
         device=args.device,
         is_half=is_half,
+        debug_runtime_output=args.debug_runtime_output,
     )
     registry = VoiceRegistry(args.profiles, repo_dir=args.repo_dir.resolve())
 
@@ -2767,13 +3021,15 @@ def main() -> None:
         if default_profile is not None:
             runtime.apply_profile_weights(default_profile)
 
-    LOGGER.info(
-        "Starting Neiroha GPT-SoVITS mode=%s host=%s port=%s repo=%s config=%s",
-        args.mode,
-        args.host,
-        port,
-        args.repo_dir,
-        args.config,
+    RUNTIME_EVENTS.append(
+        "launcher_start",
+        mode=args.mode,
+        host=args.host,
+        port=port,
+        repo_dir=str(args.repo_dir),
+        config_path=str(args.config),
+        debug_runtime_output=bool(args.debug_runtime_output),
+        terminal_rtf_log=terminal_rtf_log,
     )
 
     if args.mode == "admin-ui":
@@ -2781,7 +3037,7 @@ def main() -> None:
         blocks.launch(server_name=args.host, server_port=port, show_error=True)
         return
 
-    app = create_api_app(runtime, registry, default_voice_id=args.default_voice, rtf_log=not args.no_rtf_log)
+    app = create_api_app(runtime, registry, default_voice_id=args.default_voice, rtf_log=terminal_rtf_log)
 
     if args.mode in {"admin", "webui"}:
         admin_port = port
@@ -2795,13 +3051,20 @@ def main() -> None:
             config_path=args.config,
             profiles_path=args.profiles,
             log_level=args.log_level,
+            debug_runtime_output=args.debug_runtime_output,
         )
-        LOGGER.info("Starting FastAPI primary on %s:%s with admin UI child on %s:%s", args.api_host, api_port, args.host, admin_port)
-        LOGGER.info(admin_process.start())
+        RUNTIME_EVENTS.append(
+            "admin_child_start",
+            api_host=args.api_host,
+            api_port=api_port,
+            admin_host=args.host,
+            admin_port=admin_port,
+        )
+        admin_process.start()
         try:
             uvicorn.run(app, host=args.api_host, port=api_port, log_level=args.log_level)
         finally:
-            LOGGER.info(admin_process.stop())
+            RUNTIME_EVENTS.append("admin_child_stop", message=admin_process.stop())
         return
 
     if args.mode == "combined":

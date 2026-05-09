@@ -25,6 +25,11 @@ POST /v1/audio/speech
 trained voice profiles only; clone mode is exposed through native
 `/gpt-sovits/*` routes so Neiroha can model it as a separate capability.
 
+`GET /v1/audio/voices` returns OpenAI-style voice objects and includes local
+extension fields (`model_id`, `model_name`, `model_type`, `text_lang`,
+`prompt_lang`) so Neiroha can distinguish normal trained voices from shared
+trained weights.
+
 `POST /v1/audio/speech` accepts standard fields:
 
 - `model`: `gpt-sovits`, `tts-1`, or `tts-1-hd`
@@ -72,6 +77,7 @@ GET  /control
 GET  /gpt-sovits/models
 GET  /gpt-sovits/voices
 GET  /gpt-sovits/capabilities
+GET  /gpt-sovits/events
 POST /gpt-sovits/clone
 POST /gpt-sovits/clone/upload
 ```
@@ -82,6 +88,21 @@ POST /gpt-sovits/clone/upload
 models list their real configured voices from `profiles/voices.json`; clone
 models do not invent voices and require reference audio plus matching
 `prompt_text`.
+
+Shared multi-speaker checkpoints, such as `AI-Hobbyist/GPT-SoVits-V2-models`,
+are treated as trained weights plus per-speaker reference audio. GPT-SoVITS
+upstream still conditions on `ref_audio_path` and `prompt_text`; this launcher
+does not synthesize fake speaker names from the checkpoint alone. The shared
+reference downloader can generate profiles such as `shared-genshin-en-furina`
+and `shared-genshin-ja-keqing`.
+
+v2ProPlus clone mode uses these default local paths:
+
+```text
+GPT    models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/s1v3.ckpt
+SoVITS models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth
+SV     models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt
+```
 
 GPT-SoVITS v2ProPlus upstream requires clone reference audio to be in the
 3-10 second range. This launcher does not patch the upstream submodule. Instead,
@@ -99,13 +120,24 @@ first `9.95s`, because that is the effective prompt audio after trimming.
 `GET /gpt-sovits/capabilities` exposes this behavior through
 `clone_reference_audio.auto_normalize_without_upstream_patch`.
 
-RTF logging is enabled by default for non-streaming synthesis:
+RTF metrics are always returned as response headers and written to the light
+runtime event log:
 
 ```text
-TTS performance mode=trained speaker=genshin-paimon audio=2.660s elapsed=22.844s rtf=8.588
+runtime/logs/api-events.jsonl
 ```
 
-Disable it with `--no-rtf-log` or `NEIROHA_GPT_SOVITS_RTF_LOG=0`.
+Read recent summaries with:
+
+```http
+GET /gpt-sovits/events?limit=80
+```
+
+The Gradio admin page has a `运行事件` / `Runtime events` tab for the same data.
+FastAPI terminal RTF lines are off by default; enable them with `--rtf-log` or
+`NEIROHA_GPT_SOVITS_RTF_LOG=1`. Raw GPT-SoVITS stdout/stderr is suppressed
+during model load and inference. Enable `--debug-runtime-output` to capture that
+raw output into `runtime/logs/api-debug.log`.
 
 ## Management
 
@@ -145,10 +177,18 @@ Available admin actions:
   `profiles/voices.json`
 - download an extended ready-to-use Genshin voices set
 - download AI-Hobbyist shared multi-speaker weights
+- download AquaV Genshin reference audio and generate shared-weight voice
+  profiles
 
 The AI-Hobbyist shared weights do not include reference audio. The admin
-download writes `models/voices/hf/AI-Hobbyist__GPT-SoVits-V2-models/shared_models.json`;
-add `ref_audio_path` and `prompt_text` before exposing those presets as voices.
+download writes `models/voices/hf/AI-Hobbyist__GPT-SoVits-V2-models/shared_models.json`.
+The reference downloader writes:
+
+- `models/reference-audio/hf/AquaV__genshin-voices-separated/reference_audios.json`
+- `profiles/voices.shared-genshin.example.json`
+
+When `activate voices.json` is enabled, those profiles are merged into the local
+gitignored `profiles/voices.json`.
 
 The CLI fallback is:
 
@@ -158,4 +198,5 @@ pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-as
 pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --genshin-demo --activate-voices
 pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --genshin-demo --genshin-extended-demo --activate-voices
 pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --shared-multispeaker-demo
+pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --shared-reference-demo --activate-voices
 ```

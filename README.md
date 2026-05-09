@@ -47,7 +47,9 @@ pixi run install-assets
 `runtime/` 只保留运行时缓存、上传临时文件和生成语音输出。
 
 更多下载入口放在 Gradio 管理页的 `模型下载` tab：预训练基座、v2ProPlus 克隆基座、
-已训练多角色 demo、扩展原神多角色 voices、AI-Hobbyist 共享权重多说话人包都可以从网页启动。下载日志写到 `runtime/logs/admin-download.*.log`。
+已训练多角色 demo、扩展原神多角色 voices、AI-Hobbyist 共享权重多说话人包、AquaV
+参考音频和 shared voice profile 生成都可以从网页启动。下载日志写到
+`runtime/logs/admin-download.*.log`。
 需要纯 CLI 时可以直接调用 `scripts/download_gpt_sovits_assets.py`。公开训练包候选见
 `docs/model-sources.md`。
 
@@ -68,6 +70,12 @@ Copy-Item profiles/voices.example.json profiles/voices.json
 `profiles/voices.genshin.example.json`，并把同样内容写到被 git 忽略的
 `profiles/voices.json`。默认包含 `genshin-paimon`、`genshin-keqing`、`genshin-klee`
 三个 voice id。
+
+如果使用共享权重参考音频下载任务，它会从
+`AquaV/genshin-voices-separated` 选取带 metadata 台词的 3-10 秒参考音频，
+生成 `profiles/voices.shared-genshin.example.json`。启用后会把
+`shared-genshin-en-*` 和 `shared-genshin-ja-*` 合并进本地
+`profiles/voices.json`。
 
 ## Run
 
@@ -118,7 +126,19 @@ Neiroha 里已经有 `gptSovits` adapter：
 本仓库现在把 GPT-SoVITS 的两种常见用法分开：
 
 - 已训练音色：例如原神角色模型。`GET /gpt-sovits/models` 会按真实配置列出模型和里面的 voices，`/v1/audio/speech` 只走这些已配置 voice。
+- 共享多说话人权重：例如 AI-Hobbyist 的 Genshin EN/JA checkpoint。GPT-SoVITS
+  upstream 推理 API 没有单独的 speaker id table，仍然靠 `ref_audio_path` +
+  `prompt_text` 来指定具体音色；本仓库会把“共享权重 + 每个角色参考音频”展开成
+  OpenAI voice profiles。
 - 声音克隆：使用 v2ProPlus 基座权重，加参考音频和对应文本。原生接口是 `POST /gpt-sovits/clone` 或上传版 `POST /gpt-sovits/clone/upload`。
+
+v2ProPlus 克隆基座的本地路径：
+
+```text
+GPT    models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/s1v3.ckpt
+SoVITS models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth
+SV     models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/sv/pretrained_eres2netv2w24s4ep4.ckpt
+```
 
 Gradio 管理页里也拆成了两个测试页：
 
@@ -130,17 +150,21 @@ GPT-SoVITS upstream 对 v2ProPlus 克隆参考音频有 3-10 秒限制。本 lau
 长于 `9.95s` 会从开头裁剪，原始上传或本地文件不会被修改。长音频的 `prompt_text` 应该对应
 前 `9.95s`。
 
-非流式推理默认会在终端打印 RTF 性能日志：
+非流式推理都会返回 RTF 响应头，并写入轻量运行事件日志：
 
 ```text
-TTS performance mode=trained speaker=genshin-paimon audio=2.660s elapsed=22.844s rtf=8.588
+runtime/logs/api-events.jsonl
 ```
 
-关闭方式：
+Gradio 管理页的 `运行事件` tab 会显示模型加载、权重切换和每次推理耗时。默认会压住
+GPT-SoVITS 自身的 stdout/stderr，避免 tqdm 和分段日志把 FastAPI 主终端刷满。
+需要排查底层输出时开启 debug：
 
 ```powershell
-pixi run python scripts/launch_gpt_sovits.py --mode api --port 12080 --no-rtf-log
+pixi run python scripts/launch_gpt_sovits.py --mode api --port 12080 --debug-runtime-output
 ```
+
+需要恢复终端 RTF 行时使用 `--rtf-log`。
 
 ## API Examples
 

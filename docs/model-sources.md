@@ -39,10 +39,27 @@ Default speakers used by this repo:
 - Compatibility: v2.
 - Caveat: the model card says it does not provide reference audio, so profiles
   need separate `ref_audio_path` and `prompt_text`.
+- Local reference helper: `scripts/download_gpt_sovits_assets.py
+  --shared-reference-demo` can pair the Genshin EN/JA presets with short
+  reference clips from `AquaV/genshin-voices-separated` and write
+  `profiles/voices.shared-genshin.example.json`.
 - License/risk: Hugging Face shows AGPL-3.0 and the model card also forbids
   redistribution and commercial use. Treat as local testing only.
 - Neiroha fit: good for testing a shared-weight multi-role profile layout after
   reference audio is supplied.
+
+### AquaV/genshin-voices-separated
+
+- URL: https://huggingface.co/datasets/AquaV/genshin-voices-separated
+- Shape: separated Genshin voice lines by character and language.
+- Assets: wav files plus metadata JSON containing `transcription`, `language`
+  and `speaker`.
+- Compatibility: useful as reference audio for GPT-SoVITS profiles when the
+  selected line is around 3-10 seconds.
+- Caveat: the dataset is large, so the downloader only pulls a few small
+  metadata/audio pairs for selected characters and languages.
+- Neiroha fit: pairs well with AI-Hobbyist shared Genshin EN/JA weights because
+  it provides the missing `ref_audio_path` + `prompt_text`.
 
 ### baicai1145/GPT-SoVITS-STAR
 

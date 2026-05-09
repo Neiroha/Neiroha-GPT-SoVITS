@@ -7,8 +7,10 @@ import sys
 import tarfile
 import time
 import urllib.request
+import wave
 import zipfile
 from pathlib import Path
+from typing import Any
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 REPO_DIR = WORKSPACE_ROOT / "GPT-SoVITS"
@@ -20,6 +22,7 @@ COMPAT_PRETRAINED_DIR = REPO_DIR / "GPT_SoVITS" / "pretrained_models"
 COMPAT_G2PW_DIR = REPO_DIR / "GPT_SoVITS" / "text" / "G2PWModel"
 ACTIVE_PROFILE_PATH = WORKSPACE_ROOT / "profiles" / "voices.json"
 GENSHIN_PROFILE_EXAMPLE_PATH = WORKSPACE_ROOT / "profiles" / "voices.genshin.example.json"
+SHARED_PROFILE_EXAMPLE_PATH = WORKSPACE_ROOT / "profiles" / "voices.shared-genshin.example.json"
 
 SOURCES = {
     "hf": {
@@ -88,6 +91,35 @@ GENSHIN_VOICE_IDS = {
 SHARED_REPO_ID = "AI-Hobbyist/GPT-SoVits-V2-models"
 SHARED_MODEL_DIR = MODELS_ROOT / "voices" / "hf" / "AI-Hobbyist__GPT-SoVits-V2-models"
 SHARED_MODEL_INDEX_PATH = SHARED_MODEL_DIR / "shared_models.json"
+SHARED_REFERENCE_REPO_ID = "AquaV/genshin-voices-separated"
+SHARED_REFERENCE_DIR = MODELS_ROOT / "reference-audio" / "hf" / "AquaV__genshin-voices-separated"
+SHARED_REFERENCE_INDEX_PATH = SHARED_REFERENCE_DIR / "reference_audios.json"
+SHARED_REFERENCE_DEFAULT_CHARACTERS = ["Furina", "Keqing", "Klee", "Zhongli", "Nahida"]
+SHARED_REFERENCE_DEFAULT_LANGUAGES = ["English(US)", "Japanese"]
+SHARED_REFERENCE_LANGUAGE_PRESETS = {
+    "English(US)": {
+        "preset": "genshin-en",
+        "lang": "en",
+        "suffix": "en",
+    },
+    "Japanese": {
+        "preset": "genshin-ja",
+        "lang": "ja",
+        "suffix": "ja",
+    },
+}
+SHARED_REFERENCE_CHARACTER_SLUGS = {
+    "Furina": "furina",
+    "Keqing": "keqing",
+    "Klee": "klee",
+    "Zhongli": "zhongli",
+    "Nahida": "nahida",
+    "Raiden Shogun": "raiden-shogun",
+    "Hu Tao": "hutao",
+    "Ganyu": "ganyu",
+    "Kamisato Ayaka": "kamisato-ayaka",
+    "Yae Miko": "yae-miko",
+}
 SHARED_PRESETS = {
     "genshin-en": {
         "name": "Genshin Impact EN 5.1",
@@ -163,6 +195,11 @@ def parse_args() -> argparse.Namespace:
         help="Download shared multi-speaker GPT-SoVITS v2 weights from AI-Hobbyist.",
     )
     parser.add_argument(
+        "--shared-reference-demo",
+        action="store_true",
+        help="Download small AquaV reference-audio samples and generate shared-weight voice profiles.",
+    )
+    parser.add_argument(
         "--shared-repo-id",
         default=SHARED_REPO_ID,
         help="Hugging Face repo id for shared multi-speaker weights.",
@@ -171,6 +208,21 @@ def parse_args() -> argparse.Namespace:
         "--shared-presets",
         default=",".join(SHARED_PRESETS),
         help=f"Comma-separated shared presets: {', '.join(SHARED_PRESETS)}.",
+    )
+    parser.add_argument(
+        "--shared-reference-repo-id",
+        default=SHARED_REFERENCE_REPO_ID,
+        help="Hugging Face dataset id for shared-weight reference audio.",
+    )
+    parser.add_argument(
+        "--shared-reference-characters",
+        default=",".join(SHARED_REFERENCE_DEFAULT_CHARACTERS),
+        help="Comma-separated Genshin character directory names for reference audio.",
+    )
+    parser.add_argument(
+        "--shared-reference-languages",
+        default=",".join(SHARED_REFERENCE_DEFAULT_LANGUAGES),
+        help="Comma-separated reference language directories, for example English(US),Japanese.",
     )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -378,6 +430,13 @@ def split_presets(raw_presets: str) -> list[str]:
     return presets
 
 
+def split_csv(raw_value: str, *, field_name: str) -> list[str]:
+    values = [item.strip() for item in raw_value.split(",") if item.strip()]
+    if not values:
+        raise SystemExit(f"{field_name} did not contain any values.")
+    return values
+
+
 def choose_genshin_file(files: list[str], speaker: str, suffix: str) -> str:
     prefix = f"{GENSHIN_ROOT}/{speaker}/"
     matches = [
@@ -408,6 +467,32 @@ def prompt_from_reference(repo_path: str) -> str:
 
 def workspace_relative(path: Path) -> str:
     return path.resolve().relative_to(WORKSPACE_ROOT.resolve()).as_posix()
+
+
+def read_profiles(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    if isinstance(data, dict):
+        data = data.get("voices", [])
+    if not isinstance(data, list):
+        raise SystemExit(f"Profile file must contain a list or voices object: {path}")
+    return [item for item in data if isinstance(item, dict)]
+
+
+def merge_active_profiles(profiles: list[dict[str, Any]]) -> None:
+    existing = read_profiles(ACTIVE_PROFILE_PATH)
+    merged: dict[str, dict[str, Any]] = {}
+    for profile in [*existing, *profiles]:
+        profile_id = str(profile.get("id") or profile.get("name") or "").strip()
+        if profile_id:
+            merged[profile_id] = profile
+    ACTIVE_PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ACTIVE_PROFILE_PATH.write_text(
+        json.dumps({"voices": list(merged.values())}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Activated/merged profiles: {ACTIVE_PROFILE_PATH}")
 
 
 def write_genshin_profiles(profiles: list[dict[str, str]], *, activate: bool) -> None:
@@ -514,6 +599,197 @@ def maybe_download_shared_multispeaker(repo_id: str, presets: list[str], *, forc
         print(f"- {record['preset']}: {record['name']} ({record['language']})")
 
 
+def download_huggingface_dataset_file(repo_id: str, repo_path: str, target: Path, *, force: bool) -> Path:
+    if target.exists() and not force:
+        print(f"Exists, skipping: {target}")
+        return target
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as exc:
+        raise SystemExit("huggingface_hub is required. Run `pixi run install-deps` first.") from exc
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() and force:
+        target.unlink()
+    print(f"Downloading HF dataset file: {repo_id}/{repo_path}")
+    downloaded = Path(
+        hf_hub_download(
+            repo_id=repo_id,
+            filename=repo_path,
+            repo_type="dataset",
+            force_download=force,
+        )
+    )
+    print(f"Copying {downloaded} -> {target}")
+    shutil.copyfile(downloaded, target)
+    return target
+
+
+def audio_duration_seconds(path: Path) -> float:
+    try:
+        import soundfile as sf
+
+        info = sf.info(path)
+        if info.samplerate:
+            return float(info.frames) / float(info.samplerate)
+    except Exception:
+        pass
+
+    with wave.open(str(path), "rb") as wav_file:
+        return float(wav_file.getnframes()) / float(wav_file.getframerate())
+
+
+def choose_shared_reference(
+    *,
+    repo_id: str,
+    character: str,
+    language: str,
+    force: bool,
+    min_seconds: float = 3.05,
+    max_seconds: float = 9.95,
+    scan_limit: int = 80,
+) -> dict[str, Any]:
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise SystemExit("huggingface_hub is required. Run `pixi run install-deps` first.") from exc
+
+    repo_prefix = f"{character}/{language}"
+    print(f"Searching reference audio: {repo_id}/{repo_prefix}")
+    files = [item.path for item in HfApi().list_repo_tree(repo_id, repo_type="dataset", path_in_repo=repo_prefix)]
+    metadata_files = sorted(path for path in files if path.endswith("_metadata.json"))
+    if not metadata_files:
+        raise SystemExit(f"No metadata files found for {repo_prefix}")
+
+    language_dir = language.replace("(", "_").replace(")", "").replace("/", "_")
+    target_dir = SHARED_REFERENCE_DIR / character / language_dir
+
+    fallback: dict[str, Any] | None = None
+    for metadata_repo_path in metadata_files[:scan_limit]:
+        stem = metadata_repo_path.removesuffix("_metadata.json")
+        audio_repo_path = f"{stem}_audio.wav"
+        if audio_repo_path not in files:
+            continue
+        metadata_target = target_dir / Path(metadata_repo_path).name
+        audio_target = target_dir / Path(audio_repo_path).name
+        download_huggingface_dataset_file(repo_id, metadata_repo_path, metadata_target, force=force)
+        metadata = json.loads(metadata_target.read_text(encoding="utf-8-sig"))
+        prompt_text = str(metadata.get("transcription") or "").strip()
+        if not prompt_text:
+            continue
+        if any(marker in prompt_text for marker in ("{", "}", "#")):
+            print(f"Skipping templated prompt text: {prompt_text}")
+            continue
+        download_huggingface_dataset_file(repo_id, audio_repo_path, audio_target, force=force)
+        duration = audio_duration_seconds(audio_target)
+        record = {
+            "repo_id": repo_id,
+            "character": character,
+            "language": language,
+            "prompt_text": prompt_text,
+            "duration_seconds": duration,
+            "ref_audio_path": workspace_relative(audio_target),
+            "metadata_path": workspace_relative(metadata_target),
+            "source_audio_path": audio_repo_path,
+            "source_metadata_path": metadata_repo_path,
+        }
+        if fallback is None:
+            fallback = record
+        if min_seconds <= duration <= max_seconds:
+            return record
+
+    if fallback is not None:
+        print(
+            "WARNING: no 3-10s sample found in scan window; "
+            f"using first readable sample at {fallback['duration_seconds']:.3f}s."
+        )
+        return fallback
+    raise SystemExit(f"No usable reference audio found for {repo_prefix}")
+
+
+def write_shared_reference_profiles(profiles: list[dict[str, Any]], *, activate: bool) -> None:
+    payload = {"voices": profiles}
+    SHARED_PROFILE_EXAMPLE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SHARED_PROFILE_EXAMPLE_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Wrote shared profile example: {SHARED_PROFILE_EXAMPLE_PATH}")
+    if activate:
+        merge_active_profiles(profiles)
+
+
+def maybe_download_shared_reference_demo(
+    *,
+    weight_repo_id: str,
+    reference_repo_id: str,
+    characters: list[str],
+    languages: list[str],
+    activate: bool,
+    force: bool,
+) -> None:
+    unknown_languages = [language for language in languages if language not in SHARED_REFERENCE_LANGUAGE_PRESETS]
+    if unknown_languages:
+        supported = ", ".join(SHARED_REFERENCE_LANGUAGE_PRESETS)
+        raise SystemExit(f"Unsupported shared reference languages: {', '.join(unknown_languages)}. Supported: {supported}")
+
+    needed_presets = sorted(
+        {SHARED_REFERENCE_LANGUAGE_PRESETS[language]["preset"] for language in languages}
+    )
+    maybe_download_shared_multispeaker(weight_repo_id, needed_presets, force=force)
+
+    reference_records = []
+    profiles = []
+    for language in languages:
+        language_info = SHARED_REFERENCE_LANGUAGE_PRESETS[language]
+        preset = SHARED_PRESETS[language_info["preset"]]
+        preset_dir = SHARED_MODEL_DIR / language_info["preset"]
+        gpt_target = preset_dir / Path(preset["gpt"]).name
+        sovits_target = preset_dir / Path(preset["sovits"]).name
+        for character in characters:
+            reference = choose_shared_reference(
+                repo_id=reference_repo_id,
+                character=character,
+                language=language,
+                force=force,
+            )
+            reference_records.append(reference)
+            slug = SHARED_REFERENCE_CHARACTER_SLUGS.get(character, character.lower().replace(" ", "-"))
+            voice_id = f"shared-genshin-{language_info['suffix']}-{slug}"
+            profiles.append(
+                {
+                    "id": voice_id,
+                    "name": f"{character} ({language_info['suffix'].upper()} shared)",
+                    "description": (
+                        f"{character} reference from {reference_repo_id}; "
+                        f"shared weights from {weight_repo_id}."
+                    ),
+                    "model_id": preset["model_id"],
+                    "model_name": preset["name"],
+                    "model_type": "shared-trained",
+                    "ref_audio_path": reference["ref_audio_path"],
+                    "prompt_text": reference["prompt_text"],
+                    "prompt_lang": language_info["lang"],
+                    "text_lang": language_info["lang"],
+                    "aux_ref_audio_paths": [],
+                    "gpt_weights_path": workspace_relative(gpt_target),
+                    "sovits_weights_path": workspace_relative(sovits_target),
+                }
+            )
+
+    SHARED_REFERENCE_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SHARED_REFERENCE_INDEX_PATH.write_text(
+        json.dumps({"references": reference_records}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Wrote shared reference index: {SHARED_REFERENCE_INDEX_PATH}")
+    write_shared_reference_profiles(profiles, activate=activate)
+    print("")
+    print("Shared reference voices")
+    for profile in profiles:
+        print(f"- {profile['id']}: {profile['name']} ({profile['prompt_text']})")
+
+
 def main() -> None:
     args = parse_args()
     if not REPO_DIR.exists():
@@ -542,6 +818,15 @@ def main() -> None:
         maybe_download_shared_multispeaker(
             args.shared_repo_id,
             split_presets(args.shared_presets),
+            force=args.force,
+        )
+    if args.shared_reference_demo:
+        maybe_download_shared_reference_demo(
+            weight_repo_id=args.shared_repo_id,
+            reference_repo_id=args.shared_reference_repo_id,
+            characters=split_csv(args.shared_reference_characters, field_name="--shared-reference-characters"),
+            languages=split_csv(args.shared_reference_languages, field_name="--shared-reference-languages"),
+            activate=args.activate_voices,
             force=args.force,
         )
     print("Asset download step finished.")
