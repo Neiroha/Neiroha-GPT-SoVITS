@@ -1,9 +1,10 @@
 # API Reference
 
-FastAPI is the real runtime API and defaults to `http://127.0.0.1:9880`.
-The Gradio admin panel is a separate management UI on `http://127.0.0.1:7860`.
-The normal `admin` task starts FastAPI as the primary process and launches the
-admin UI as a child process.
+FastAPI is the real runtime API. Its default host/port comes from
+`configs/server.toml` and is currently `http://127.0.0.1:19880`.
+The Gradio admin panel is a separate management UI, currently
+`http://127.0.0.1:17860`. The normal `api-admin` task starts FastAPI as the
+primary process and launches the admin UI as a child process.
 
 ## Health
 
@@ -32,9 +33,10 @@ trained weights.
 
 `POST /v1/audio/speech` accepts standard fields:
 
-- `model`: `gpt-sovits`, `tts-1`, or `tts-1-hd`
+- `model`: voice set id, such as `default`; legacy aliases `gpt-sovits`,
+  `tts-1`, and `tts-1-hd` resolve to the active voice set
 - `input`: text to synthesize
-- `voice`: profile id from `profiles/voices.json`
+- `voice`: voice profile id from `runtime/voices/<voice-id>/voice.toml`
 - `response_format`: `mp3`, `opus`, `aac`, `flac`, `wav`, `pcm`, `ogg`, or `raw`
 - `speed`: mapped to GPT-SoVITS `speed_factor`
 
@@ -50,10 +52,11 @@ Local GPT-SoVITS extensions:
 - `text_split_method`
 - `top_k`, `top_p`, `temperature`, `seed`
 
-For the bundled Hugging Face Genshin demo downloader, the default voice ids are
-`genshin-paimon`, `genshin-keqing`, and `genshin-klee`. The generated
-`profiles/voices.json` points each voice at its own GPT checkpoint, SoVITS
-checkpoint, reference wav, and prompt text.
+The default sample voice id is `genshin-keqing`. Layered Neiroha configuration
+uses TOML: `configs/voice-sets/default.toml`,
+`runtime/voices/genshin-keqing/voice.toml`, and
+`configs/model-presets/default.toml`. Legacy `profiles/voices.json` is still
+read for compatibility, but it is no longer the primary configuration shape.
 
 Every non-streaming synthesis writes a copy under `runtime/outputs/` using
 `speaker_YYYYMMDDHHMMSS.ext` naming and returns that path in the
@@ -84,10 +87,9 @@ POST /gpt-sovits/clone/upload
 
 `POST /tts` follows the official `api_v2.py` shape and returns audio bytes.
 
-`/gpt-sovits/models` separates trained voice models from clone models. Trained
-models list their real configured voices from `profiles/voices.json`; clone
-models do not invent voices and require reference audio plus matching
-`prompt_text`.
+`/gpt-sovits/models` returns low-level model presets. OpenAI `model` values are
+voice sets, not these low-level presets. Clone voices require reference audio
+plus matching `prompt_text`.
 
 Shared multi-speaker checkpoints, such as `AI-Hobbyist/GPT-SoVits-V2-models`,
 are treated as trained weights plus per-speaker reference audio. GPT-SoVITS
@@ -96,8 +98,8 @@ does not synthesize fake speaker names from the checkpoint alone. The shared
 reference downloader can generate profiles such as `shared-genshin-en-furina`
 and `shared-genshin-ja-keqing`.
 
-The Gradio admin page also includes an `OpenAI Voice 配置` profile builder. It
-can register any combination of:
+The Gradio admin page includes a Voice Config builder. It can register any
+combination of:
 
 - GPT weights path
 - SoVITS weights path
@@ -105,8 +107,9 @@ can register any combination of:
 - prompt text matching the reference audio
 - prompt/text language
 
-The builder writes `profiles/voices.json`; because the FastAPI registry reads
-that file on each request, newly saved voices become visible through
+The builder writes `runtime/voices/<voice-id>/voice.toml` and updates the
+selected `configs/voice-sets/<set-id>.toml`; because the FastAPI registry reads
+those files on each request, newly saved voices become visible through
 `GET /v1/audio/voices` without restarting the API.
 
 v2ProPlus clone mode uses these default local paths:
@@ -140,6 +143,9 @@ runtime log:
 runtime/logs/backend.log
 ```
 
+Each top-level launcher start rotates the previous file to
+`runtime/logs/backend.previous.log` and starts a fresh `backend.log`.
+
 Read recent summaries, newest first, with:
 
 ```http
@@ -168,7 +174,7 @@ POST /gpt-sovits/speech/upload
 
 ```json
 {
-  "config_path": "GPT-SoVITS/GPT_SoVITS/configs/tts_infer.yaml",
+  "config_path": "runtime/cache/tts_infer.yaml",
   "gpt_weights_path": "",
   "sovits_weights_path": ""
 }

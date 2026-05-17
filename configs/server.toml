@@ -1,12 +1,16 @@
 [api]
 host = "127.0.0.1"
-port = 9880
+port = 19880
 preload_model = false
 
 [admin]
 enabled = true
 host = "127.0.0.1"
-port = 7860
+port = 17860
+
+[ui]
+title = "Neiroha GPT-SoVITS Admin"
+default_language = "zh"
 
 [runtime]
 active_model_preset = "v2proplus-clone"

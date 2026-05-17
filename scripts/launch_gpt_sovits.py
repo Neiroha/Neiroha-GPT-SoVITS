@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import datetime as dt
 import gc
+import hashlib
 import io
 import json
 import logging
@@ -36,7 +37,7 @@ from pydantic import BaseModel, Field
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPO_DIR = WORKSPACE_ROOT / "GPT-SoVITS"
-CONFIG_TEMPLATE_PATH = WORKSPACE_ROOT / "configs" / "tts_infer.yaml"
+CONFIG_TEMPLATE_PATH = DEFAULT_REPO_DIR / "GPT_SoVITS" / "configs" / "tts_infer.yaml"
 CONFIG_ROOT = WORKSPACE_ROOT / "configs"
 SERVER_CONFIG_PATH = CONFIG_ROOT / "server.toml"
 UI_CONFIG_PATH = CONFIG_ROOT / "ui.toml"
@@ -114,6 +115,21 @@ class RuntimeEventLog:
         self.path = path
         self.lock = threading.RLock()
 
+    def reset_for_launch(self) -> None:
+        previous_path = self.path.with_name(f"{self.path.stem}.previous{self.path.suffix}")
+        with self.lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.path.exists() and self.path.stat().st_size > 0:
+                previous_path.unlink(missing_ok=True)
+                try:
+                    self.path.replace(previous_path)
+                except OSError:
+                    previous_path.write_text(
+                        self.path.read_text(encoding="utf-8", errors="replace"),
+                        encoding="utf-8",
+                    )
+            self.path.write_text("", encoding="utf-8")
+
     def append(self, event: str, **fields: Any) -> None:
         timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         details = " ".join(
@@ -169,6 +185,59 @@ def strip_text(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    if value is None:
+        value = ""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def write_toml_mapping(path: Path, payload: dict[str, Any]) -> None:
+    lines: list[str] = []
+    nested: list[tuple[str, dict[str, Any]]] = []
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            nested.append((key, value))
+        else:
+            lines.append(f"{key} = {toml_value(value)}")
+    for table, values in nested:
+        lines.append("")
+        lines.append(f"[{table}]")
+        if values:
+            for key, value in values.items():
+                lines.append(f"{key} = {toml_value(value)}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def read_mapping_file(path: Path) -> dict[str, Any]:
+    if path.suffix.lower() == ".toml":
+        with path.open("rb") as file:
+            payload = tomllib.load(file)
+    else:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Config file must contain an object/table: {path}")
+    return payload
+
+
+def load_ui_config(registry: "VoiceRegistry") -> dict[str, Any]:
+    config: dict[str, Any] = {}
+    ui_config = registry.server_config().get("ui", {})
+    if isinstance(ui_config, dict):
+        config.update(ui_config)
+    if UI_CONFIG_PATH.exists():
+        config.update(read_mapping_file(UI_CONFIG_PATH))
+    return config
 
 
 def first_non_empty(*values: Any) -> str:
@@ -277,11 +346,23 @@ def safe_filename_part(value: Any, fallback: str = "speech") -> str:
     return text or fallback
 
 
+def safe_ascii_filename_part(value: Any, fallback: str = "speech") -> str:
+    raw = strip_text(value) or fallback
+    text = safe_filename_part(raw, fallback=fallback)
+    ascii_text = text.encode("ascii", errors="ignore").decode("ascii")
+    ascii_text = re.sub(r"[^A-Za-z0-9._-]+", "_", ascii_text)
+    ascii_text = re.sub(r"_+", "_", ascii_text).strip("._-")
+    if ascii_text:
+        return ascii_text[:80]
+    digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    return f"{fallback}_{digest}"
+
+
 def write_runtime_output(content: bytes, speaker: Any, response_format: str) -> Path:
     fmt = require_supported_format(response_format)
     suffix = "raw" if fmt in {"pcm", "raw"} else fmt
     timestamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
-    speaker_name = safe_filename_part(speaker)
+    speaker_name = safe_ascii_filename_part(speaker)
     path = OUTPUT_ROOT / f"{speaker_name}_{timestamp}.{suffix}"
     counter = 1
     while path.exists():
@@ -289,6 +370,15 @@ def write_runtime_output(content: bytes, speaker: Any, response_format: str) -> 
         counter += 1
     path.write_bytes(content)
     return path
+
+
+def header_safe_path(path: Path) -> str:
+    text = str(path)
+    try:
+        text.encode("latin-1")
+        return text
+    except UnicodeEncodeError:
+        return profile_path_text(path)
 
 
 def ensure_default_config(config_path: Path) -> Path:
@@ -300,9 +390,9 @@ def ensure_default_config(config_path: Path) -> Path:
     if CONFIG_TEMPLATE_PATH.exists():
         shutil.copyfile(CONFIG_TEMPLATE_PATH, config_path)
     else:
-        fallback = DEFAULT_REPO_DIR / "GPT_SoVITS" / "configs" / "tts_infer.yaml"
-        if fallback.exists():
-            shutil.copyfile(fallback, config_path)
+        legacy_template = CONFIG_ROOT / "tts_infer.yaml"
+        if legacy_template.exists():
+            shutil.copyfile(legacy_template, config_path)
         else:
             raise FileNotFoundError(f"Default TTS config template is missing: {CONFIG_TEMPLATE_PATH}")
     return config_path
@@ -564,7 +654,7 @@ class VoiceRegistry:
         voice_sets_dir: Path = VOICE_SETS_DIR,
         runtime_voices_dir: Path = RUNTIME_VOICES_ROOT,
         server_config_path: Path = SERVER_CONFIG_PATH,
-        active_state_path: Path = RUNTIME_STATE_ROOT / "active.json",
+        active_state_path: Path = RUNTIME_STATE_ROOT / "active.toml",
     ) -> None:
         self.profile_path = profile_path
         self.repo_dir = repo_dir
@@ -585,10 +675,16 @@ class VoiceRegistry:
         runtime_config = self.server_config().get("runtime", {})
         if isinstance(runtime_config, dict):
             state.update(runtime_config)
-        if self.active_state_path.exists():
-            data = json.loads(self.active_state_path.read_text(encoding="utf-8-sig"))
+        candidates = [self.active_state_path]
+        if self.active_state_path.suffix.lower() == ".toml":
+            candidates.append(self.active_state_path.with_suffix(".json"))
+        for path in candidates:
+            if not path.exists():
+                continue
+            data = read_mapping_file(path)
             if isinstance(data, dict):
                 state.update(data)
+            break
         return state
 
     def active_model_preset_id(self) -> str:
@@ -642,10 +738,15 @@ class VoiceRegistry:
     def list_voice_sets(self) -> list[VoiceSet]:
         voice_sets: list[VoiceSet] = []
         if self.voice_sets_dir.exists():
-            for path in sorted(self.voice_sets_dir.glob("*.json")):
-                payload = json.loads(path.read_text(encoding="utf-8-sig"))
-                if isinstance(payload, dict):
-                    voice_sets.append(VoiceSet.from_mapping(payload))
+            seen: set[str] = set()
+            for pattern in ("*.toml", "*.json"):
+                for path in sorted(self.voice_sets_dir.glob(pattern)):
+                    payload = read_mapping_file(path)
+                    voice_set = VoiceSet.from_mapping(payload)
+                    if voice_set.id in seen:
+                        continue
+                    seen.add(voice_set.id)
+                    voice_sets.append(voice_set)
         if not voice_sets:
             profiles = self._read_payload()
             voices = [strip_text(item.get("id") or item.get("name")) for item in profiles if isinstance(item, dict)]
@@ -676,12 +777,13 @@ class VoiceRegistry:
         return self.get_voice_set(model_id) is not None
 
     def _read_voice_profile(self, voice_id: str, voice_set: VoiceSet) -> Optional[VoiceProfile]:
-        voice_path = self.runtime_voices_dir / voice_id / "voice.json"
+        voice_dir = self.runtime_voices_dir / voice_id
+        voice_path = voice_dir / "voice.toml"
+        if not voice_path.exists():
+            voice_path = voice_dir / "voice.json"
         if not voice_path.exists():
             return None
-        payload = json.loads(voice_path.read_text(encoding="utf-8-sig"))
-        if not isinstance(payload, dict):
-            return None
+        payload = read_mapping_file(voice_path)
         preset_id = strip_text(payload.get("model_preset")) or self.active_model_preset_id()
         preset = self.get_model_preset(preset_id)
         payload = {
@@ -1324,7 +1426,7 @@ def audio_response(
     output_path = write_runtime_output(content, speaker or "speech", fmt)
     headers = {
         "Content-Disposition": f'inline; filename="{output_path.name}"',
-        "X-Neiroha-Output-Path": str(output_path),
+        "X-Neiroha-Output-Path": header_safe_path(output_path),
     }
     if metrics:
         headers.update(
@@ -1513,7 +1615,7 @@ def create_api_app(
                     "object": "voice",
                     "model": registry.active_voice_set_id(),
                     "task_mode": "prompt_clone",
-                    "description": "Configure runtime/voices/<voice-id>/voice.json or pass ref_audio_path in the request.",
+                    "description": "Configure runtime/voices/<voice-id>/voice.toml or pass ref_audio_path in the request.",
                 }
             ]
         compact = [
@@ -2286,8 +2388,8 @@ class ManagedGradioProcess:
             assert self.process is not None
             return f"Admin UI is already running with PID {self.process.pid}."
         self.stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.stdout_path.open("a", encoding="utf-8") as stdout_file, self.stderr_path.open(
-            "a",
+        with self.stdout_path.open("w", encoding="utf-8") as stdout_file, self.stderr_path.open(
+            "w",
             encoding="utf-8",
         ) as stderr_file:
             self.process = subprocess.Popen(
@@ -2395,10 +2497,7 @@ def build_gradio_admin_blocks_legacy(
 
     base = api_base.rstrip("/")
     download_manager = ManagedDownloadProcess()
-    ui_config: dict[str, Any] = {}
-    if UI_CONFIG_PATH.exists():
-        with UI_CONFIG_PATH.open("rb") as file:
-            ui_config = tomllib.load(file)
+    ui_config = load_ui_config(registry)
     language = strip_text(os.environ.get("NEIROHA_GPT_SOVITS_UI_LANG") or ui_config.get("default_language") or "zh")
     language = "en" if language.lower().startswith("en") else "zh"
     ui_title = strip_text(ui_config.get("title")) or "Neiroha GPT-SoVITS Admin"
@@ -2979,7 +3078,7 @@ def build_gradio_admin_blocks_legacy(
         if response is not None and response.status_code == 404 and path == "/gpt-sovits/clone/upload":
             return (
                 "Clone upload endpoint not found on the connected FastAPI process. "
-                "This usually means port 12080/9880 is still serving an older launcher. "
+                "This usually means the configured API port is still serving an older launcher. "
                 "Stop that process or change ports, then start FastAPI again from the admin page."
             )
         if response is None:
@@ -3660,10 +3759,7 @@ def build_gradio_admin_blocks(
 
     base = api_base.rstrip("/")
     download_manager = ManagedDownloadProcess()
-    ui_config: dict[str, Any] = {}
-    if UI_CONFIG_PATH.exists():
-        with UI_CONFIG_PATH.open("rb") as file:
-            ui_config = tomllib.load(file)
+    ui_config = load_ui_config(registry)
     language = strip_text(os.environ.get("NEIROHA_GPT_SOVITS_UI_LANG") or ui_config.get("default_language") or "zh")
     language = "en" if language.lower().startswith("en") else "zh"
     ui_title = strip_text(ui_config.get("title")) or "Neiroha GPT-SoVITS Admin"
@@ -3972,6 +4068,8 @@ def build_gradio_admin_blocks(
             suffix = require_supported_format(response_format or "wav")
             output_path = str(OUTPUT_ROOT / f"admin_preview_{dt.datetime.now().strftime('%Y%m%d%H%M%S')}.{suffix}")
             Path(output_path).write_bytes(response.content)
+        elif not Path(output_path).is_absolute():
+            output_path = str((WORKSPACE_ROOT / output_path).resolve())
         metrics = {
             "output_path": output_path,
             "audio_seconds": response.headers.get("X-Neiroha-Audio-Seconds", ""),
@@ -4134,14 +4232,16 @@ def build_gradio_admin_blocks(
         if strip_text(gpt_weights_path) or strip_text(sovits_weights_path):
             payload["gpt_weights_path"] = strip_text(gpt_weights_path)
             payload["sovits_weights_path"] = strip_text(sovits_weights_path)
-        (voice_dir / "voice.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        voice_profile_path = voice_dir / "voice.toml"
+        write_toml_mapping(voice_profile_path, payload)
+        (voice_dir / "voice.json").unlink(missing_ok=True)
 
-        voice_set_path = VOICE_SETS_DIR / f"{voice_set_id}.json"
+        voice_set_path = VOICE_SETS_DIR / f"{voice_set_id}.toml"
+        legacy_voice_set_path = VOICE_SETS_DIR / f"{voice_set_id}.json"
         if voice_set_path.exists():
-            voice_set_payload = json.loads(voice_set_path.read_text(encoding="utf-8-sig"))
+            voice_set_payload = read_mapping_file(voice_set_path)
+        elif legacy_voice_set_path.exists():
+            voice_set_payload = read_mapping_file(legacy_voice_set_path)
         else:
             voice_set_payload = {
                 "schema_version": 1,
@@ -4156,13 +4256,11 @@ def build_gradio_admin_blocks(
             if strip_text(item) and strip_text(item) != voice_id
         ]
         voice_set_payload["voices"] = [*voices, voice_id]
-        voice_set_path.parent.mkdir(parents=True, exist_ok=True)
-        voice_set_path.write_text(
-            json.dumps(voice_set_payload, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        write_toml_mapping(voice_set_path, voice_set_payload)
+        legacy_voice_set_path.unlink(missing_ok=True)
         status = (
-            f"{t('saved_voice_profile')}: {profile_path_text(voice_dir / 'voice.json')}\n"
+            f"{t('saved_voice_profile')}: {profile_path_text(voice_profile_path)}\n"
+            f"Reference audio: {reference_audio}\n"
             f"Voice set: {profile_path_text(voice_set_path)}"
         )
         models, voices_update = refresh_choices(voice_set_id)
@@ -4522,6 +4620,8 @@ def local_api_base(api_base: str, api_port: int) -> str:
 def main() -> None:
     configure_logging()
     args = parse_args()
+    if args.mode != "admin-ui":
+        RUNTIME_EVENTS.reset_for_launch()
     is_half = True if args.half else False if args.no_half else None
     terminal_rtf_log = bool(args.rtf_log and not args.no_rtf_log)
 

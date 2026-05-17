@@ -6,6 +6,7 @@ import shutil
 import sys
 import tarfile
 import time
+import tomllib
 import urllib.request
 import wave
 import zipfile
@@ -31,6 +32,49 @@ SAMPLE_VOICE_ID = "genshin-keqing"
 SAMPLE_VOICE_NAME = "Keqing Sample"
 SAMPLE_VOICE_SET_ID = "default"
 SAMPLE_REFERENCE_SPEAKER = "刻晴"
+
+
+def toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    if value is None:
+        value = ""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def write_toml_mapping(path: Path, payload: dict[str, Any]) -> None:
+    lines: list[str] = []
+    nested: list[tuple[str, dict[str, Any]]] = []
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            nested.append((key, value))
+        else:
+            lines.append(f"{key} = {toml_value(value)}")
+    for table, values in nested:
+        lines.append("")
+        lines.append(f"[{table}]")
+        if values:
+            for key, value in values.items():
+                lines.append(f"{key} = {toml_value(value)}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def read_mapping_file(path: Path) -> dict[str, Any]:
+    if path.suffix.lower() == ".toml":
+        with path.open("rb") as file:
+            payload = tomllib.load(file)
+    else:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise SystemExit(f"Config file must contain an object/table: {path}")
+    return payload
 
 SOURCES = {
     "hf": {
@@ -192,7 +236,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--activate-voices",
         action="store_true",
-        help="Update configs/voice-sets/default.json and runtime/voices/<id>/voice.json.",
+        help="Update configs/voice-sets/default.toml and runtime/voices/<id>/voice.toml.",
     )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -562,17 +606,19 @@ def write_single_sample_voice(*, reference_audio: Path, prompt_text: str, activa
         "speed": 1.0,
         "engine_options": {},
     }
-    (voice_dir / "voice.json").write_text(
-        json.dumps(voice_payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    print(f"Wrote sample voice: {voice_dir / 'voice.json'}")
+    voice_profile_path = voice_dir / "voice.toml"
+    write_toml_mapping(voice_profile_path, voice_payload)
+    (voice_dir / "voice.json").unlink(missing_ok=True)
+    print(f"Wrote sample voice: {voice_profile_path}")
 
     if activate:
         VOICE_SETS_DIR.mkdir(parents=True, exist_ok=True)
-        voice_set_path = VOICE_SETS_DIR / f"{SAMPLE_VOICE_SET_ID}.json"
+        voice_set_path = VOICE_SETS_DIR / f"{SAMPLE_VOICE_SET_ID}.toml"
+        legacy_voice_set_path = VOICE_SETS_DIR / f"{SAMPLE_VOICE_SET_ID}.json"
         if voice_set_path.exists():
-            voice_set = json.loads(voice_set_path.read_text(encoding="utf-8-sig"))
+            voice_set = read_mapping_file(voice_set_path)
+        elif legacy_voice_set_path.exists():
+            voice_set = read_mapping_file(legacy_voice_set_path)
         else:
             voice_set = {
                 "schema_version": 1,
@@ -583,7 +629,8 @@ def write_single_sample_voice(*, reference_audio: Path, prompt_text: str, activa
             }
         voices = [item for item in voice_set.get("voices", []) if item != SAMPLE_VOICE_ID]
         voice_set["voices"] = [*voices, SAMPLE_VOICE_ID]
-        voice_set_path.write_text(json.dumps(voice_set, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_toml_mapping(voice_set_path, voice_set)
+        legacy_voice_set_path.unlink(missing_ok=True)
         print(f"Activated sample voice in: {voice_set_path}")
 
 

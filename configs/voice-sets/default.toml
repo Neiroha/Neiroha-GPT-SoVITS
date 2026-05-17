@@ -1,0 +1,5 @@
+schema_version = 1
+id = "default"
+name = "Default"
+description = "Default voices exposed as OpenAI TTS models."
+voices = ["genshin-keqing"]

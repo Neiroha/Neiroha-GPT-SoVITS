@@ -25,9 +25,9 @@ Flutter / OpenAI API 侧的 `model` 不是底层权重模型，而是 voice set 
 
 ```text
 model=default
-  -> configs/voice-sets/default.json
+  -> configs/voice-sets/default.toml
 voice=local-voice
-  -> runtime/voices/local-voice/voice.json
+  -> runtime/voices/local-voice/voice.toml
 model_preset=cosyvoice-default
   -> configs/model-presets/cosyvoice-default.toml
 mode=prompt_clone / zero_shot / sft
@@ -89,17 +89,14 @@ CosyVoice 项目内使用同样的配置语义，但内容只服务 CosyVoice：
 ```text
 configs/
   server.toml
-  ui.toml
   model-presets/
     default.toml
   voice-sets/
-    default.json
+    default.toml
 runtime/
-  state/
-    active.json
   voices/
     local-voice/
-      voice.json
+      voice.toml
       reference.wav
   logs/
     backend.log
@@ -120,18 +117,14 @@ enabled = true
 host = "127.0.0.1"
 port = 17860
 
+[ui]
+title = "Neiroha CosyVoice Admin"
+default_language = "zh" # zh | en
+
 [runtime]
 active_model_preset = "cosyvoice-default"
 active_voice_set = "default"
 default_voice = "local-voice"
-```
-
-`configs/ui.toml`：
-
-```toml
-schema_version = 1
-title = "Neiroha CosyVoice Admin"
-default_language = "zh" # zh | en
 ```
 
 `configs/model-presets/default.toml`：
@@ -150,36 +143,36 @@ load_vllm = false
 
 如果 CosyVoice 项目使用的是其他官方基座模型，`model_dir` 改成实际默认路径，但语义保持不变。
 
-`configs/voice-sets/default.json`：
+Neiroha 自己维护的配置统一使用 TOML。JSON 只用于 HTTP API 请求 / 响应示例，
+不要再把 Admin 面向用户的配置拆成 JSON。
 
-```json
-{
-  "schema_version": 1,
-  "id": "default",
-  "name": "Default",
-  "description": "Default voices exposed as OpenAI TTS models.",
-  "voices": ["local-voice"]
-}
+`configs/voice-sets/default.toml`：
+
+```toml
+schema_version = 1
+id = "default"
+name = "Default"
+description = "Default voices exposed as OpenAI TTS models."
+voices = ["local-voice"]
 ```
 
-`runtime/voices/local-voice/voice.json`：
+`runtime/voices/local-voice/voice.toml`：
 
-```json
-{
-  "schema_version": 1,
-  "id": "local-voice",
-  "name": "Local Voice",
-  "mode": "prompt_clone",
-  "model_preset": "cosyvoice-default",
-  "reference_audio": "runtime/voices/local-voice/reference.wav",
-  "prompt_audio": "",
-  "prompt_text": "参考音频对应文本",
-  "text_lang": "zh",
-  "prompt_lang": "zh",
-  "instruction": "",
-  "speed": 1.0,
-  "engine_options": {}
-}
+```toml
+schema_version = 1
+id = "local-voice"
+name = "Local Voice"
+mode = "prompt_clone"
+model_preset = "cosyvoice-default"
+reference_audio = "runtime/voices/local-voice/reference.wav"
+prompt_audio = ""
+prompt_text = "参考音频对应文本"
+text_lang = "zh"
+prompt_lang = "zh"
+instruction = ""
+speed = 1.0
+
+[engine_options]
 ```
 
 ## 下载边界
@@ -191,7 +184,7 @@ load_vllm = false
 
 不要批量下载社区角色包、别人训练好的大量 voice bank 或无关 demo 文件。用户想要更多声音时，让用户自己下载到本地，然后在 Admin 中新增 voice / preset。
 
-如果 CosyVoice 支持外部微调权重或 speaker embedding，Admin 要允许用户填本地路径，保存到 `voice.json` 或单独的 model preset 里；不要把这些文件内置到项目仓库。
+如果 CosyVoice 支持外部微调权重或 speaker embedding，Admin 要允许用户填本地路径，保存到 `voice.toml` 或单独的 model preset 里；不要把这些文件内置到项目仓库。
 
 ## 训练模型和 voice 的处理
 
@@ -203,18 +196,16 @@ GPT-SoVITS 这次的关键经验是：不能只有“参考音频克隆”，还
 
 建议 voice profile 扩展方式：
 
-```json
-{
-  "mode": "prompt_clone",
-  "model_preset": "cosyvoice-default",
-  "reference_audio": "runtime/voices/local-voice/reference.wav",
-  "prompt_text": "参考音频对应文本",
-  "engine_options": {
-    "speaker_id": "",
-    "speaker_embedding_path": "",
-    "adapter_path": ""
-  }
-}
+```toml
+mode = "prompt_clone"
+model_preset = "cosyvoice-default"
+reference_audio = "runtime/voices/local-voice/reference.wav"
+prompt_text = "参考音频对应文本"
+
+[engine_options]
+speaker_id = ""
+speaker_embedding_path = ""
+adapter_path = ""
 ```
 
 字段名要和 CosyVoice 实际加载逻辑对齐，但 Admin 的产品语义保持一致：用户先选 voice set，再选 voice，必要时 voice 内部覆盖底层模型或训练资产。
@@ -223,7 +214,7 @@ GPT-SoVITS 这次的关键经验是：不能只有“参考音频克隆”，还
 
 Gradio 不会自动把自定义中文标签翻译成英文；需要项目自己做标签表。CosyVoice Admin 应支持：
 
-- `configs/ui.toml` 中 `default_language = "zh"` 或 `"en"`。
+- `configs/server.toml` 的 `[ui] default_language = "zh"` 或 `"en"`。
 - 环境变量覆盖：`NEIROHA_COSYVOICE_UI_LANG=en`。
 
 首页不要显示大段 JSON。首页只放 Admin 需要看的状态，且自动刷新：
@@ -259,7 +250,9 @@ runtime/logs/backend.log
 runtime/logs/download.log
 ```
 
-日志页默认展示最新内容在上方，并自动刷新。结构化事件如果内部确实需要，可以另存内部文件，但 Admin 直接面向用户时只显示可读日志。
+日志页默认展示最新内容在上方，并自动刷新。每次顶层 launcher 启动时，把上一轮
+`backend.log` 轮转成 `backend.previous.log`，然后重新创建本轮日志，避免无限累积。
+结构化事件如果内部确实需要，可以另存内部文件，但 Admin 直接面向用户时只显示可读日志。
 
 ## API 返回形状
 

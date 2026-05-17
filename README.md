@@ -21,17 +21,14 @@ The current shape is intentionally small:
 ```text
 configs/
   server.toml
-  ui.toml
   model-presets/
     default.toml
   voice-sets/
-    default.json
+    default.toml
 runtime/
-  state/
-    active.json
   voices/
     genshin-keqing/
-      voice.json
+      voice.toml
       reference.wav
   logs/
   outputs/
@@ -39,8 +36,12 @@ models/
   pretrained/
 ```
 
-`configs/voice-sets/default.json` maps to `model=default` in the Neiroha /
-OpenAI-compatible API. `runtime/voices/genshin-keqing/voice.json` maps to
+Neiroha-owned configuration is TOML. The only YAML file is the generated
+GPT-SoVITS runtime cache at `runtime/cache/tts_infer.yaml`, because upstream
+GPT-SoVITS expects that shape.
+
+`configs/voice-sets/default.toml` maps to `model=default` in the Neiroha /
+OpenAI-compatible API. `runtime/voices/genshin-keqing/voice.toml` maps to
 `voice=genshin-keqing`. `configs/model-presets/default.toml` is the low-level
 GPT-SoVITS runtime preset.
 
@@ -96,7 +97,8 @@ Gradio does not automatically translate custom labels, but this Admin supports
 Chinese and English labels at launch time. Set:
 
 ```toml
-# configs/ui.toml
+# configs/server.toml
+[ui]
 default_language = "en" # zh | en
 ```
 
@@ -111,7 +113,10 @@ Then restart Admin.
 ## Logs
 
 The Admin Logs tab shows `runtime/logs/backend.log`, newest entries first, with
-automatic refresh. Download tasks still write:
+automatic refresh. Each top-level launcher start rotates the previous file to
+`runtime/logs/backend.previous.log` and starts a fresh `backend.log`, so normal
+use does not accumulate one endless log file. Download tasks still write fresh
+per-run files:
 
 ```text
 runtime/logs/admin-download.out.log
@@ -123,19 +128,19 @@ runtime/logs/admin-download.err.log
 List voice sets:
 
 ```powershell
-curl.exe http://127.0.0.1:9880/v1/models
+curl.exe http://127.0.0.1:19880/v1/models
 ```
 
 List voices:
 
 ```powershell
-curl.exe http://127.0.0.1:9880/v1/audio/voices
+curl.exe http://127.0.0.1:19880/v1/audio/voices
 ```
 
 Synthesize speech:
 
 ```powershell
-curl.exe http://127.0.0.1:9880/v1/audio/speech `
+curl.exe http://127.0.0.1:19880/v1/audio/speech `
   -H "Content-Type: application/json" `
   -d '{ "model":"default", "voice":"genshin-keqing", "input":"Hello, this is a voice cloning test.", "response_format":"wav" }' `
   --output speech.wav
@@ -157,35 +162,34 @@ and `.pth` paths directly.
 Manual voice profile path:
 
 ```text
-runtime/voices/my_voice/voice.json
+runtime/voices/my_voice/voice.toml
 ```
 
 Then add `my_voice` to:
 
 ```text
-configs/voice-sets/default.json
+configs/voice-sets/default.toml
 ```
 
 Example:
 
-```json
-{
-  "schema_version": 1,
-  "id": "my_voice",
-  "name": "My Voice",
-  "mode": "prompt_clone",
-  "model_preset": "v2proplus-clone",
-  "reference_audio": "runtime/voices/my_voice/reference.wav",
-  "prompt_audio": "",
-  "prompt_text": "Transcript matching the reference audio.",
-  "text_lang": "zh",
-  "prompt_lang": "zh",
-  "instruction": "",
-  "speed": 1.0,
-  "engine_options": {},
-  "gpt_weights_path": "models/voices/my-trained/GPT_xxx.ckpt",
-  "sovits_weights_path": "models/voices/my-trained/SV_xxx.pth"
-}
+```toml
+schema_version = 1
+id = "my_voice"
+name = "My Voice"
+mode = "prompt_clone"
+model_preset = "v2proplus-clone"
+reference_audio = "runtime/voices/my_voice/reference.wav"
+prompt_audio = ""
+prompt_text = "Transcript matching the reference audio."
+text_lang = "zh"
+prompt_lang = "zh"
+instruction = ""
+speed = 1.0
+gpt_weights_path = "models/voices/my-trained/GPT_xxx.ckpt"
+sovits_weights_path = "models/voices/my-trained/SV_xxx.pth"
+
+[engine_options]
 ```
 
 `gpt_weights_path` and `sovits_weights_path` are optional per-voice overrides.

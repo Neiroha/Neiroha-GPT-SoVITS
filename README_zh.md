@@ -17,17 +17,14 @@
 ```text
 configs/
   server.toml
-  ui.toml
   model-presets/
     default.toml
   voice-sets/
-    default.json
+    default.toml
 runtime/
-  state/
-    active.json
   voices/
     genshin-keqing/
-      voice.json
+      voice.toml
       reference.wav
   logs/
   outputs/
@@ -35,8 +32,11 @@ models/
   pretrained/
 ```
 
-`configs/voice-sets/default.json` 对应 Neiroha / OpenAI API 里的 `model=default`。
-`runtime/voices/genshin-keqing/voice.json` 对应 `voice=genshin-keqing`。
+Neiroha 自己维护的配置统一使用 TOML。唯一保留的 YAML 是
+`runtime/cache/tts_infer.yaml`，这是 GPT-SoVITS 上游推理配置缓存，不作为用户侧主配置。
+
+`configs/voice-sets/default.toml` 对应 Neiroha / OpenAI API 里的 `model=default`。
+`runtime/voices/genshin-keqing/voice.toml` 对应 `voice=genshin-keqing`。
 `configs/model-presets/default.toml` 才是 GPT-SoVITS 的底层权重 preset。
 
 ## 安装
@@ -88,7 +88,8 @@ Gradio 不会自动翻译自定义 label，但本项目的 Admin 已经支持启
 修改：
 
 ```toml
-# configs/ui.toml
+# configs/server.toml
+[ui]
 default_language = "zh" # zh | en
 ```
 
@@ -103,27 +104,33 @@ $env:NEIROHA_GPT_SOVITS_UI_LANG="en"
 ## 日志
 
 Admin 的“日志”页显示最新的 `runtime/logs/backend.log`，默认最新在上并自动刷新。
-下载任务仍写到 `runtime/logs/admin-download.out.log` 和
-`runtime/logs/admin-download.err.log`。
+每次顶层 launcher 启动时会把上一轮 `backend.log` 轮转成
+`runtime/logs/backend.previous.log`，然后重新创建本轮日志，避免一个日志文件无限膨胀。
+下载任务仍会每次重新写：
+
+```text
+runtime/logs/admin-download.out.log
+runtime/logs/admin-download.err.log
+```
 
 ## API
 
 列出 voice set：
 
 ```powershell
-curl.exe http://127.0.0.1:9880/v1/models
+curl.exe http://127.0.0.1:19880/v1/models
 ```
 
 列出 voice：
 
 ```powershell
-curl.exe http://127.0.0.1:9880/v1/audio/voices
+curl.exe http://127.0.0.1:19880/v1/audio/voices
 ```
 
 语音复刻：
 
 ```powershell
-curl.exe http://127.0.0.1:9880/v1/audio/speech `
+curl.exe http://127.0.0.1:19880/v1/audio/speech `
   -H "Content-Type: application/json" `
   -d '{ "model":"default", "voice":"genshin-keqing", "input":"你好，这是一次语音复刻测试。", "response_format":"wav" }' `
   --output speech.wav
@@ -142,35 +149,34 @@ curl.exe http://127.0.0.1:9880/v1/audio/speech `
 也可以手动创建：
 
 ```text
-runtime/voices/my_voice/voice.json
+runtime/voices/my_voice/voice.toml
 ```
 
 然后把 `my_voice` 加到：
 
 ```text
-configs/voice-sets/default.json
+configs/voice-sets/default.toml
 ```
 
 voice 配置示例：
 
-```json
-{
-  "schema_version": 1,
-  "id": "my_voice",
-  "name": "My Voice",
-  "mode": "prompt_clone",
-  "model_preset": "v2proplus-clone",
-  "reference_audio": "runtime/voices/my_voice/reference.wav",
-  "prompt_audio": "",
-  "prompt_text": "参考音频对应文本",
-  "text_lang": "zh",
-  "prompt_lang": "zh",
-  "instruction": "",
-  "speed": 1.0,
-  "engine_options": {},
-  "gpt_weights_path": "models/voices/my-trained/GPT_xxx.ckpt",
-  "sovits_weights_path": "models/voices/my-trained/SV_xxx.pth"
-}
+```toml
+schema_version = 1
+id = "my_voice"
+name = "My Voice"
+mode = "prompt_clone"
+model_preset = "v2proplus-clone"
+reference_audio = "runtime/voices/my_voice/reference.wav"
+prompt_audio = ""
+prompt_text = "参考音频对应文本"
+text_lang = "zh"
+prompt_lang = "zh"
+instruction = ""
+speed = 1.0
+gpt_weights_path = "models/voices/my-trained/GPT_xxx.ckpt"
+sovits_weights_path = "models/voices/my-trained/SV_xxx.pth"
+
+[engine_options]
 ```
 
 `gpt_weights_path` 和 `sovits_weights_path` 是可选覆盖项；不填时使用
