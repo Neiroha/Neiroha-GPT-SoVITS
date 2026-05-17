@@ -2,7 +2,7 @@
 .venv/
 __pycache__/
 *.pyc
-runtime/
+runtime/*
 models/
 logs/
 outputs/
@@ -13,3 +13,10 @@ outputs/
 *.aac
 *.pcm
 profiles/voices.json
+!runtime/
+!runtime/state/
+!runtime/state/active.json
+!runtime/voices/
+!runtime/voices/*/
+!runtime/voices/*/voice.json
+!runtime/voices/*/reference.wav

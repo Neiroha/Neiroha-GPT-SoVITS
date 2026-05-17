@@ -15,6 +15,10 @@ from typing import Any
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 REPO_DIR = WORKSPACE_ROOT / "GPT-SoVITS"
 MODELS_ROOT = WORKSPACE_ROOT / "models"
+CONFIG_ROOT = WORKSPACE_ROOT / "configs"
+VOICE_SETS_DIR = CONFIG_ROOT / "voice-sets"
+RUNTIME_ROOT = WORKSPACE_ROOT / "runtime"
+RUNTIME_VOICES_ROOT = RUNTIME_ROOT / "voices"
 DOWNLOAD_DIR = MODELS_ROOT / "downloads"
 PRETRAINED_PACKAGE_DIR = MODELS_ROOT / "pretrained" / "GPT-SoVITS" / "GPT_SoVITS"
 PRETRAINED_DIR = PRETRAINED_PACKAGE_DIR / "pretrained_models"
@@ -23,6 +27,10 @@ COMPAT_G2PW_DIR = REPO_DIR / "GPT_SoVITS" / "text" / "G2PWModel"
 ACTIVE_PROFILE_PATH = WORKSPACE_ROOT / "profiles" / "voices.json"
 GENSHIN_PROFILE_EXAMPLE_PATH = WORKSPACE_ROOT / "profiles" / "voices.genshin.example.json"
 SHARED_PROFILE_EXAMPLE_PATH = WORKSPACE_ROOT / "profiles" / "voices.shared-genshin.example.json"
+SAMPLE_VOICE_ID = "genshin-keqing"
+SAMPLE_VOICE_NAME = "Keqing Sample"
+SAMPLE_VOICE_SET_ID = "default"
+SAMPLE_REFERENCE_SPEAKER = "刻晴"
 
 SOURCES = {
     "hf": {
@@ -53,11 +61,23 @@ HF_PRETRAINED_PREFIX = "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/reso
 V2PRO_PLUS_FILES = {
     "s1v3.ckpt": PRETRAINED_DIR / "s1v3.ckpt",
     "v2Pro/s2Gv2ProPlus.pth": PRETRAINED_DIR / "v2Pro" / "s2Gv2ProPlus.pth",
-    "v2Pro/s2Dv2ProPlus.pth": PRETRAINED_DIR / "v2Pro" / "s2Dv2ProPlus.pth",
     "sv/pretrained_eres2netv2w24s4ep4.ckpt": PRETRAINED_DIR
     / "sv"
     / "pretrained_eres2netv2w24s4ep4.ckpt",
 }
+
+UNUSED_PRETRAINED_PATHS = [
+    "s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt",
+    "s2G488k.pth",
+    "s2D488k.pth",
+    "s2Gv3.pth",
+    "gsv-v2final-pretrained",
+    "gsv-v4-pretrained",
+    "models--nvidia--bigvgan_v2_24khz_100band_256x",
+    "v2Pro/s2Gv2Pro.pth",
+    "v2Pro/s2Dv2Pro.pth",
+    "v2Pro/s2Dv2ProPlus.pth",
+]
 
 GENSHIN_REPO_ID = "UnlimitedBurst/GPT-SoVITS"
 GENSHIN_ROOT = "原神（已更新4.8）"
@@ -165,64 +185,14 @@ def parse_args() -> argparse.Namespace:
         help="Skip the common pretrained/G2PW/NLTK/OpenJTalk asset downloads.",
     )
     parser.add_argument(
-        "--genshin-demo",
+        "--sample-reference",
         action="store_true",
-        help="Download a small ready-to-switch multi-speaker Genshin GPT-SoVITS demo set.",
-    )
-    parser.add_argument(
-        "--genshin-extended-demo",
-        action="store_true",
-        help="Use the larger built-in Genshin speaker set for --genshin-demo.",
-    )
-    parser.add_argument(
-        "--genshin-speakers",
-        default=",".join(GENSHIN_DEFAULT_SPEAKERS),
-        help="Comma-separated speaker names from UnlimitedBurst/GPT-SoVITS.",
-    )
-    parser.add_argument(
-        "--genshin-repo-id",
-        default=GENSHIN_REPO_ID,
-        help="Hugging Face repo id for the Genshin speaker models.",
+        help="Download only the single bundled reference voice used by the default voice set.",
     )
     parser.add_argument(
         "--activate-voices",
         action="store_true",
-        help="Write the downloaded demo profiles to profiles/voices.json.",
-    )
-    parser.add_argument(
-        "--shared-multispeaker-demo",
-        action="store_true",
-        help="Download shared multi-speaker GPT-SoVITS v2 weights from AI-Hobbyist.",
-    )
-    parser.add_argument(
-        "--shared-reference-demo",
-        action="store_true",
-        help="Download small AquaV reference-audio samples and generate shared-weight voice profiles.",
-    )
-    parser.add_argument(
-        "--shared-repo-id",
-        default=SHARED_REPO_ID,
-        help="Hugging Face repo id for shared multi-speaker weights.",
-    )
-    parser.add_argument(
-        "--shared-presets",
-        default=",".join(SHARED_PRESETS),
-        help=f"Comma-separated shared presets: {', '.join(SHARED_PRESETS)}.",
-    )
-    parser.add_argument(
-        "--shared-reference-repo-id",
-        default=SHARED_REFERENCE_REPO_ID,
-        help="Hugging Face dataset id for shared-weight reference audio.",
-    )
-    parser.add_argument(
-        "--shared-reference-characters",
-        default=",".join(SHARED_REFERENCE_DEFAULT_CHARACTERS),
-        help="Comma-separated Genshin character directory names for reference audio.",
-    )
-    parser.add_argument(
-        "--shared-reference-languages",
-        default=",".join(SHARED_REFERENCE_DEFAULT_LANGUAGES),
-        help="Comma-separated reference language directories, for example English(US),Japanese.",
+        help="Update configs/voice-sets/default.json and runtime/voices/<id>/voice.json.",
     )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -337,6 +307,19 @@ def sync_compat_tree(source: Path, target: Path) -> None:
     shutil.copytree(source, target)
 
 
+def prune_unused_pretrained_assets() -> None:
+    for root in (PRETRAINED_DIR, COMPAT_PRETRAINED_DIR):
+        for relative_path in UNUSED_PRETRAINED_PATHS:
+            target = root / relative_path
+            if not target.exists():
+                continue
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+            print(f"Pruned unused pretrained asset: {target}")
+
+
 def maybe_download_pretrained(urls: dict[str, str], *, force: bool) -> None:
     markers = [
         PRETRAINED_DIR / "chinese-roberta-wwm-ext-large",
@@ -409,7 +392,6 @@ def maybe_download_v2pro_plus(*, force: bool) -> None:
     print("v2ProPlus local paths")
     print(f"GPT weights : {PRETRAINED_DIR / 's1v3.ckpt'}")
     print(f"SoVITS G    : {PRETRAINED_DIR / 'v2Pro' / 's2Gv2ProPlus.pth'}")
-    print(f"SoVITS D    : {PRETRAINED_DIR / 'v2Pro' / 's2Dv2ProPlus.pth'}")
     print(f"SV model    : {PRETRAINED_DIR / 'sv' / 'pretrained_eres2netv2w24s4ep4.ckpt'}")
 
 
@@ -560,6 +542,66 @@ def maybe_download_genshin_demo(repo_id: str, speakers: list[str], *, activate: 
     print("Genshin demo voices")
     for profile in profiles:
         print(f"- {profile['id']}: {profile['name']} ({profile['prompt_text']})")
+
+
+def write_single_sample_voice(*, reference_audio: Path, prompt_text: str, activate: bool) -> None:
+    voice_dir = RUNTIME_VOICES_ROOT / SAMPLE_VOICE_ID
+    voice_dir.mkdir(parents=True, exist_ok=True)
+    voice_payload = {
+        "schema_version": 1,
+        "id": SAMPLE_VOICE_ID,
+        "name": SAMPLE_VOICE_NAME,
+        "mode": "prompt_clone",
+        "model_preset": "v2proplus-clone",
+        "reference_audio": workspace_relative(reference_audio),
+        "prompt_audio": "",
+        "prompt_text": prompt_text,
+        "text_lang": "zh",
+        "prompt_lang": "zh",
+        "instruction": "",
+        "speed": 1.0,
+        "engine_options": {},
+    }
+    (voice_dir / "voice.json").write_text(
+        json.dumps(voice_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Wrote sample voice: {voice_dir / 'voice.json'}")
+
+    if activate:
+        VOICE_SETS_DIR.mkdir(parents=True, exist_ok=True)
+        voice_set_path = VOICE_SETS_DIR / f"{SAMPLE_VOICE_SET_ID}.json"
+        if voice_set_path.exists():
+            voice_set = json.loads(voice_set_path.read_text(encoding="utf-8-sig"))
+        else:
+            voice_set = {
+                "schema_version": 1,
+                "id": SAMPLE_VOICE_SET_ID,
+                "name": "Default",
+                "description": "Default voices exposed as OpenAI TTS models.",
+                "voices": [],
+            }
+        voices = [item for item in voice_set.get("voices", []) if item != SAMPLE_VOICE_ID]
+        voice_set["voices"] = [*voices, SAMPLE_VOICE_ID]
+        voice_set_path.write_text(json.dumps(voice_set, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"Activated sample voice in: {voice_set_path}")
+
+
+def maybe_download_sample_reference(*, activate: bool, force: bool) -> None:
+    try:
+        from huggingface_hub import HfApi
+    except ImportError as exc:
+        raise SystemExit("huggingface_hub is required. Run `pixi run install-deps` first.") from exc
+
+    print(f"Listing sample reference files from Hugging Face: {GENSHIN_REPO_ID}")
+    files = HfApi().list_repo_files(repo_id=GENSHIN_REPO_ID, repo_type="model")
+    ref_repo_path = choose_genshin_ref(files, SAMPLE_REFERENCE_SPEAKER)
+    target = RUNTIME_VOICES_ROOT / SAMPLE_VOICE_ID / "reference.wav"
+    download_huggingface_model_file(GENSHIN_REPO_ID, ref_repo_path, target, force=force)
+    write_single_sample_voice(reference_audio=target, prompt_text=prompt_from_reference(ref_repo_path), activate=activate)
+    print("")
+    print("Single sample reference voice")
+    print(f"- {SAMPLE_VOICE_ID}: {SAMPLE_VOICE_NAME} ({prompt_from_reference(ref_repo_path)})")
 
 
 def maybe_download_shared_multispeaker(repo_id: str, presets: list[str], *, force: bool) -> None:
@@ -806,29 +848,9 @@ def main() -> None:
             maybe_download_uvr5(urls, force=args.force)
     if args.v2pro_plus:
         maybe_download_v2pro_plus(force=args.force)
-    if args.genshin_demo:
-        speakers = GENSHIN_EXTENDED_SPEAKERS if args.genshin_extended_demo else split_speakers(args.genshin_speakers)
-        maybe_download_genshin_demo(
-            args.genshin_repo_id,
-            speakers,
-            activate=args.activate_voices,
-            force=args.force,
-        )
-    if args.shared_multispeaker_demo:
-        maybe_download_shared_multispeaker(
-            args.shared_repo_id,
-            split_presets(args.shared_presets),
-            force=args.force,
-        )
-    if args.shared_reference_demo:
-        maybe_download_shared_reference_demo(
-            weight_repo_id=args.shared_repo_id,
-            reference_repo_id=args.shared_reference_repo_id,
-            characters=split_csv(args.shared_reference_characters, field_name="--shared-reference-characters"),
-            languages=split_csv(args.shared_reference_languages, field_name="--shared-reference-languages"),
-            activate=args.activate_voices,
-            force=args.force,
-        )
+    if args.sample_reference:
+        maybe_download_sample_reference(activate=args.activate_voices, force=args.force)
+    prune_unused_pretrained_assets()
     print("Asset download step finished.")
 
 

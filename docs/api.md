@@ -134,19 +134,19 @@ first `9.95s`, because that is the effective prompt audio after trimming.
 `clone_reference_audio.auto_normalize_without_upstream_patch`.
 
 RTF metrics are always returned as response headers and written to the light
-runtime event log:
+runtime log:
 
 ```text
-runtime/logs/api-events.jsonl
+runtime/logs/backend.log
 ```
 
-Read recent summaries with:
+Read recent summaries, newest first, with:
 
 ```http
-GET /gpt-sovits/events?limit=80
+GET /gpt-sovits/logs?limit=80
 ```
 
-The Gradio admin page has a `运行事件` / `Runtime events` tab for the same data.
+The Gradio admin page has a `日志` tab that refreshes the same log automatically.
 FastAPI terminal RTF lines are off by default; enable them with `--rtf-log` or
 `NEIROHA_GPT_SOVITS_RTF_LOG=1`. Raw GPT-SoVITS stdout/stderr is suppressed
 during model load and inference. Enable `--debug-runtime-output` to capture that
@@ -186,30 +186,18 @@ Available admin actions:
 
 - download common pretrained base assets
 - download v2ProPlus clone base weights
-- download a small trained multi-role demo model set and optionally activate
-  `profiles/voices.json`
-- download an extended ready-to-use Genshin voices set
-- download AI-Hobbyist shared multi-speaker weights
-- download AquaV Genshin reference audio and generate shared-weight voice
-  profiles
+- download one default sample reference voice
+- register local trained GPT/SoVITS weights as model presets or per-voice
+  overrides
 
-The AI-Hobbyist shared weights do not include reference audio. The admin
-download writes `models/voices/hf/AI-Hobbyist__GPT-SoVits-V2-models/shared_models.json`.
-The reference downloader writes:
-
-- `models/reference-audio/hf/AquaV__genshin-voices-separated/reference_audios.json`
-- `profiles/voices.shared-genshin.example.json`
-
-When `activate voices.json` is enabled, those profiles are merged into the local
-gitignored `profiles/voices.json`.
+Multi-role trained packages are no longer bundled as first-class download
+actions. Download those files yourself, then register the `.ckpt` and `.pth`
+paths in the Admin.
 
 The CLI fallback is:
 
 ```powershell
 pixi run install-assets
 pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --v2pro-plus
-pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --genshin-demo --activate-voices
-pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --genshin-demo --genshin-extended-demo --activate-voices
-pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --shared-multispeaker-demo
-pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --shared-reference-demo --activate-voices
+pixi run python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --sample-reference --activate-voices
 ```

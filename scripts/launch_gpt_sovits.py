@@ -11,11 +11,13 @@ import os
 import re
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,11 +37,19 @@ from pydantic import BaseModel, Field
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPO_DIR = WORKSPACE_ROOT / "GPT-SoVITS"
 CONFIG_TEMPLATE_PATH = WORKSPACE_ROOT / "configs" / "tts_infer.yaml"
+CONFIG_ROOT = WORKSPACE_ROOT / "configs"
+SERVER_CONFIG_PATH = CONFIG_ROOT / "server.toml"
+UI_CONFIG_PATH = CONFIG_ROOT / "ui.toml"
+MODEL_PRESETS_DIR = CONFIG_ROOT / "model-presets"
+VOICE_SETS_DIR = CONFIG_ROOT / "voice-sets"
 DEFAULT_PROFILE_PATH = WORKSPACE_ROOT / "profiles" / "voices.json"
 MODELS_ROOT = WORKSPACE_ROOT / "models"
 PRETRAINED_MODELS_DIR = MODELS_ROOT / "pretrained" / "GPT-SoVITS" / "GPT_SoVITS" / "pretrained_models"
 DEFAULT_CLONE_GPT_WEIGHTS = PRETRAINED_MODELS_DIR / "s1v3.ckpt"
 DEFAULT_CLONE_SOVITS_WEIGHTS = PRETRAINED_MODELS_DIR / "v2Pro" / "s2Gv2ProPlus.pth"
+DEFAULT_MODEL_PRESET_ID = "v2proplus-clone"
+DEFAULT_VOICE_SET_ID = "default"
+DEFAULT_SAMPLE_VOICE_ID = "genshin-keqing"
 CLONE_REFERENCE_MIN_SECONDS = 3.05
 CLONE_REFERENCE_MAX_SECONDS = 9.95
 DEFAULT_DOWNLOAD_SOURCE = "modelscope"
@@ -54,15 +64,27 @@ DEFAULT_SHARED_REFERENCE_LANGUAGES = "English(US),Japanese"
 RUNTIME_ROOT = WORKSPACE_ROOT / "runtime"
 RUNTIME_CACHE_ROOT = RUNTIME_ROOT / "cache"
 RUNTIME_LOG_ROOT = RUNTIME_ROOT / "logs"
+RUNTIME_STATE_ROOT = RUNTIME_ROOT / "state"
+RUNTIME_VOICES_ROOT = RUNTIME_ROOT / "voices"
 TEMP_ROOT = RUNTIME_ROOT / "temp"
 UPLOAD_ROOT = TEMP_ROOT / "uploads"
 OUTPUT_ROOT = RUNTIME_ROOT / "outputs"
 LOCAL_REFERENCE_ROOT = MODELS_ROOT / "reference-audio" / "local"
 DEFAULT_CONFIG_PATH = RUNTIME_CACHE_ROOT / "tts_infer.yaml"
-RUNTIME_EVENT_LOG_PATH = RUNTIME_LOG_ROOT / "api-events.jsonl"
+RUNTIME_EVENT_LOG_PATH = RUNTIME_LOG_ROOT / "backend.log"
 RUNTIME_DEBUG_LOG_PATH = RUNTIME_LOG_ROOT / "api-debug.log"
 
-for path in (RUNTIME_ROOT, RUNTIME_CACHE_ROOT, RUNTIME_LOG_ROOT, TEMP_ROOT, UPLOAD_ROOT, OUTPUT_ROOT, LOCAL_REFERENCE_ROOT):
+for path in (
+    RUNTIME_ROOT,
+    RUNTIME_CACHE_ROOT,
+    RUNTIME_LOG_ROOT,
+    RUNTIME_STATE_ROOT,
+    RUNTIME_VOICES_ROOT,
+    TEMP_ROOT,
+    UPLOAD_ROOT,
+    OUTPUT_ROOT,
+    LOCAL_REFERENCE_ROOT,
+):
     path.mkdir(parents=True, exist_ok=True)
 
 os.environ.setdefault("TMPDIR", str(TEMP_ROOT))
@@ -72,7 +94,8 @@ os.environ.setdefault("GRADIO_TEMP_DIR", str(TEMP_ROOT / "gradio"))
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 LOGGER = logging.getLogger("neiroha.gpt_sovits")
-OPENAI_MODEL_ALIAS = "gpt-sovits"
+OPENAI_MODEL_ALIAS = DEFAULT_VOICE_SET_ID
+LEGACY_OPENAI_MODEL_ALIASES = {"gpt-sovits", "tts-1", "tts-1-hd"}
 SUPPORTED_OPENAI_FORMATS = {"mp3", "opus", "aac", "flac", "wav", "pcm", "ogg", "raw"}
 CONTENT_TYPES = {
     "mp3": "audio/mpeg",
@@ -92,28 +115,39 @@ class RuntimeEventLog:
         self.lock = threading.RLock()
 
     def append(self, event: str, **fields: Any) -> None:
-        payload = {
-            "time": dt.datetime.now().isoformat(timespec="seconds"),
-            "event": event,
-            **fields,
-        }
+        timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        details = " ".join(
+            f"{key}={self._format_value(value)}"
+            for key, value in fields.items()
+            if value is not None and self._format_value(value) != ""
+        )
+        line = f"{timestamp} | {event}"
+        if details:
+            line = f"{line} | {details}"
         with self.lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self.path.open("a", encoding="utf-8") as file:
-                file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                file.write(line + "\n")
 
-    def tail(self, limit: int = 80) -> list[dict[str, Any]]:
+    def tail(self, limit: int = 120, *, newest_first: bool = True) -> str:
         if not self.path.exists():
-            return []
+            return f"No log file yet: {self.path}"
         with self.lock:
             lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
-        events = []
-        for line in lines[-max(limit, 1) :]:
-            with contextlib.suppress(json.JSONDecodeError):
-                item = json.loads(line)
-                if isinstance(item, dict):
-                    events.append(item)
-        return events
+        tail = lines[-max(limit, 1) :]
+        if newest_first:
+            tail = list(reversed(tail))
+        return "\n".join(tail) or f"No log entries yet: {self.path}"
+
+    def _format_value(self, value: Any) -> str:
+        if isinstance(value, float):
+            return f"{value:.3f}"
+        if isinstance(value, (dict, list, tuple)):
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        text = str(value).replace("\r", " ").replace("\n", " ").strip()
+        if " " in text:
+            return json.dumps(text, ensure_ascii=False)
+        return text
 
 
 RUNTIME_EVENTS = RuntimeEventLog(RUNTIME_EVENT_LOG_PATH)
@@ -206,6 +240,8 @@ def resolve_optional_path(raw_path: Optional[str], *, repo_dir: Path) -> Optiona
     if candidate.is_absolute():
         return str(candidate)
     workspace_candidate = WORKSPACE_ROOT / candidate
+    if candidate.parts and candidate.parts[0] in {"configs", "models", "profiles", "runtime"}:
+        return str(workspace_candidate.resolve())
     if workspace_candidate.exists():
         return str(workspace_candidate.resolve())
     repo_candidate = repo_dir / candidate
@@ -349,6 +385,74 @@ def wave_header_chunk(sample_rate: int, channels: int = 1, sample_width: int = 2
 
 
 @dataclass
+class ModelPreset:
+    id: str
+    name: str
+    engine: str = "gpt-sovits"
+    config_path: str = str(DEFAULT_CONFIG_PATH)
+    gpt_weights_path: str = str(DEFAULT_CLONE_GPT_WEIGHTS)
+    sovits_weights_path: str = str(DEFAULT_CLONE_SOVITS_WEIGHTS)
+
+    @classmethod
+    def from_toml(cls, payload: dict[str, Any], *, repo_dir: Path) -> "ModelPreset":
+        preset_id = strip_text(payload.get("id")) or DEFAULT_MODEL_PRESET_ID
+        gpt_sovits = payload.get("gpt_sovits") if isinstance(payload.get("gpt_sovits"), dict) else {}
+        return cls(
+            id=preset_id,
+            name=first_non_empty(payload.get("name"), preset_id),
+            engine=strip_text(payload.get("engine")) or "gpt-sovits",
+            config_path=resolve_optional_path(gpt_sovits.get("config_path"), repo_dir=repo_dir)
+            or str(DEFAULT_CONFIG_PATH),
+            gpt_weights_path=resolve_optional_path(gpt_sovits.get("gpt_weights_path"), repo_dir=repo_dir)
+            or str(DEFAULT_CLONE_GPT_WEIGHTS),
+            sovits_weights_path=resolve_optional_path(gpt_sovits.get("sovits_weights_path"), repo_dir=repo_dir)
+            or str(DEFAULT_CLONE_SOVITS_WEIGHTS),
+        )
+
+    def to_native_model(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "object": "gpt_sovits.model_preset",
+            "type": "clone",
+            "name": self.name,
+            "engine": self.engine,
+            "config_path": self.config_path,
+            "gpt_weights_path": self.gpt_weights_path,
+            "sovits_weights_path": self.sovits_weights_path,
+            "requires_reference_audio": True,
+        }
+
+
+@dataclass
+class VoiceSet:
+    id: str
+    name: str
+    description: str = ""
+    voices: list[str] | None = None
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any]) -> "VoiceSet":
+        set_id = first_non_empty(payload.get("id"), payload.get("name"), DEFAULT_VOICE_SET_ID)
+        voices = payload.get("voices") if isinstance(payload.get("voices"), list) else []
+        return cls(
+            id=set_id,
+            name=first_non_empty(payload.get("name"), set_id),
+            description=strip_text(payload.get("description")),
+            voices=[strip_text(item) for item in voices if strip_text(item)],
+        )
+
+    def to_openai_model(self, voice_count: int) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "object": "model",
+            "owned_by": "neiroha",
+            "name": self.name,
+            "description": self.description,
+            "voice_count": voice_count,
+        }
+
+
+@dataclass
 class VoiceProfile:
     id: str
     name: str
@@ -362,14 +466,23 @@ class VoiceProfile:
     description: str = ""
     model_id: str = ""
     model_name: str = ""
-    model_type: str = "trained"
+    model_type: str = "prompt_clone"
+    voice_set_id: str = DEFAULT_VOICE_SET_ID
+    voice_set_name: str = "Default"
+    model_preset: str = DEFAULT_MODEL_PRESET_ID
+    instruction: str = ""
+    speed: float = 1.0
+    engine_options: dict[str, Any] | None = None
 
     @classmethod
     def from_mapping(cls, payload: dict[str, Any], *, repo_dir: Path) -> "VoiceProfile":
         profile_id = first_non_empty(payload.get("id"), payload.get("name"))
         if not profile_id:
             raise ValueError("Voice profile requires an id or name.")
-        ref_audio_path = resolve_optional_path(payload.get("ref_audio_path"), repo_dir=repo_dir) or ""
+        ref_audio_path = resolve_optional_path(
+            first_non_empty(payload.get("ref_audio_path"), payload.get("reference_audio")),
+            repo_dir=repo_dir,
+        ) or ""
         aux_paths = payload.get("aux_ref_audio_paths") or []
         resolved_aux = [
             resolve_optional_path(path, repo_dir=repo_dir) or ""
@@ -391,18 +504,31 @@ class VoiceProfile:
             description=strip_text(payload.get("description")),
             model_id=strip_text(payload.get("model_id")),
             model_name=strip_text(payload.get("model_name")),
-            model_type=strip_text(payload.get("model_type")) or "trained",
+            model_type=strip_text(payload.get("model_type") or payload.get("mode")) or "prompt_clone",
+            voice_set_id=strip_text(payload.get("voice_set_id") or payload.get("model")) or DEFAULT_VOICE_SET_ID,
+            voice_set_name=strip_text(payload.get("voice_set_name")) or "Default",
+            model_preset=strip_text(payload.get("model_preset")) or DEFAULT_MODEL_PRESET_ID,
+            instruction=strip_text(payload.get("instruction")),
+            speed=float(payload.get("speed") or 1.0),
+            engine_options=payload.get("engine_options") if isinstance(payload.get("engine_options"), dict) else {},
         )
 
     def to_openai_voice(self) -> dict[str, Any]:
+        model = self.voice_set_id or self.model_id or DEFAULT_VOICE_SET_ID
+        task_mode = self.model_type or "prompt_clone"
         return {
             "id": self.id,
+            "voice_id": self.id,
             "name": self.name,
             "object": "voice",
             "description": self.description,
+            "model": model,
             "model_id": self.model_id,
             "model_name": self.model_name,
             "model_type": self.model_type,
+            "task_mode": task_mode,
+            "mode": task_mode,
+            "model_preset": self.model_preset,
             "text_lang": self.text_lang,
             "prompt_lang": self.prompt_lang,
         }
@@ -418,6 +544,8 @@ class VoiceProfile:
             "description": self.description,
             "model_id": model_id or self.model_id,
             "model_type": self.model_type,
+            "voice_set_id": self.voice_set_id,
+            "model_preset": self.model_preset,
             "prompt_lang": self.prompt_lang,
             "text_lang": self.text_lang,
             "has_reference_audio": bool(self.ref_audio_path),
@@ -427,9 +555,53 @@ class VoiceProfile:
 
 
 class VoiceRegistry:
-    def __init__(self, profile_path: Path, *, repo_dir: Path) -> None:
+    def __init__(
+        self,
+        profile_path: Path,
+        *,
+        repo_dir: Path,
+        model_presets_dir: Path = MODEL_PRESETS_DIR,
+        voice_sets_dir: Path = VOICE_SETS_DIR,
+        runtime_voices_dir: Path = RUNTIME_VOICES_ROOT,
+        server_config_path: Path = SERVER_CONFIG_PATH,
+        active_state_path: Path = RUNTIME_STATE_ROOT / "active.json",
+    ) -> None:
         self.profile_path = profile_path
         self.repo_dir = repo_dir
+        self.model_presets_dir = model_presets_dir
+        self.voice_sets_dir = voice_sets_dir
+        self.runtime_voices_dir = runtime_voices_dir
+        self.server_config_path = server_config_path
+        self.active_state_path = active_state_path
+
+    def server_config(self) -> dict[str, Any]:
+        if not self.server_config_path.exists():
+            return {}
+        with self.server_config_path.open("rb") as file:
+            return tomllib.load(file)
+
+    def active_state(self) -> dict[str, Any]:
+        state: dict[str, Any] = {}
+        runtime_config = self.server_config().get("runtime", {})
+        if isinstance(runtime_config, dict):
+            state.update(runtime_config)
+        if self.active_state_path.exists():
+            data = json.loads(self.active_state_path.read_text(encoding="utf-8-sig"))
+            if isinstance(data, dict):
+                state.update(data)
+        return state
+
+    def active_model_preset_id(self) -> str:
+        return strip_text(self.active_state().get("active_model_preset")) or DEFAULT_MODEL_PRESET_ID
+
+    def active_voice_set_id(self) -> str:
+        return strip_text(self.active_state().get("active_voice_set")) or DEFAULT_VOICE_SET_ID
+
+    def default_voice_id(self) -> str:
+        return strip_text(self.active_state().get("default_voice")) or DEFAULT_SAMPLE_VOICE_ID
+
+    def _uses_layered_config(self) -> bool:
+        return self.voice_sets_dir.exists() or self.runtime_voices_dir.exists() or self.model_presets_dir.exists()
 
     def _read_payload(self) -> list[dict[str, Any]]:
         if not self.profile_path.exists():
@@ -441,7 +613,103 @@ class VoiceRegistry:
             raise ValueError(f"Voice profile file must contain a list or voices object: {self.profile_path}")
         return data
 
-    def list_profiles(self) -> list[VoiceProfile]:
+    def list_model_presets(self) -> list[ModelPreset]:
+        presets: list[ModelPreset] = []
+        if self.model_presets_dir.exists():
+            for path in sorted(self.model_presets_dir.glob("*.toml")):
+                with path.open("rb") as file:
+                    payload = tomllib.load(file)
+                presets.append(ModelPreset.from_toml(payload, repo_dir=self.repo_dir))
+        if not presets:
+            presets.append(
+                ModelPreset(
+                    id=DEFAULT_MODEL_PRESET_ID,
+                    name="GPT-SoVITS v2ProPlus Clone",
+                    config_path=str(DEFAULT_CONFIG_PATH),
+                    gpt_weights_path=str(DEFAULT_CLONE_GPT_WEIGHTS),
+                    sovits_weights_path=str(DEFAULT_CLONE_SOVITS_WEIGHTS),
+                )
+            )
+        return presets
+
+    def get_model_preset(self, preset_id: str) -> ModelPreset:
+        preset_id = strip_text(preset_id) or self.active_model_preset_id()
+        for preset in self.list_model_presets():
+            if preset.id == preset_id:
+                return preset
+        raise ValueError(f"Unknown model preset: {preset_id}")
+
+    def list_voice_sets(self) -> list[VoiceSet]:
+        voice_sets: list[VoiceSet] = []
+        if self.voice_sets_dir.exists():
+            for path in sorted(self.voice_sets_dir.glob("*.json")):
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
+                if isinstance(payload, dict):
+                    voice_sets.append(VoiceSet.from_mapping(payload))
+        if not voice_sets:
+            profiles = self._read_payload()
+            voices = [strip_text(item.get("id") or item.get("name")) for item in profiles if isinstance(item, dict)]
+            voice_sets.append(
+                VoiceSet(
+                    id=DEFAULT_VOICE_SET_ID,
+                    name="Default",
+                    description="Legacy profiles/voices.json voice set.",
+                    voices=[item for item in voices if item],
+                )
+            )
+        return voice_sets
+
+    def get_voice_set(self, model_id: str = "") -> Optional[VoiceSet]:
+        target = self.normalize_voice_set_id(model_id)
+        for voice_set in self.list_voice_sets():
+            if target in {voice_set.id, voice_set.name}:
+                return voice_set
+        return None
+
+    def normalize_voice_set_id(self, model_id: str = "") -> str:
+        model_id = strip_text(model_id)
+        if not model_id or model_id in LEGACY_OPENAI_MODEL_ALIASES:
+            return self.active_voice_set_id()
+        return model_id
+
+    def has_voice_set(self, model_id: str = "") -> bool:
+        return self.get_voice_set(model_id) is not None
+
+    def _read_voice_profile(self, voice_id: str, voice_set: VoiceSet) -> Optional[VoiceProfile]:
+        voice_path = self.runtime_voices_dir / voice_id / "voice.json"
+        if not voice_path.exists():
+            return None
+        payload = json.loads(voice_path.read_text(encoding="utf-8-sig"))
+        if not isinstance(payload, dict):
+            return None
+        preset_id = strip_text(payload.get("model_preset")) or self.active_model_preset_id()
+        preset = self.get_model_preset(preset_id)
+        payload = {
+            **payload,
+            "voice_set_id": voice_set.id,
+            "voice_set_name": voice_set.name,
+            "model_id": voice_set.id,
+            "model_name": voice_set.name,
+            "gpt_weights_path": payload.get("gpt_weights_path") or preset.gpt_weights_path,
+            "sovits_weights_path": payload.get("sovits_weights_path") or preset.sovits_weights_path,
+            "model_preset": preset.id,
+        }
+        return VoiceProfile.from_mapping(payload, repo_dir=self.repo_dir)
+
+    def list_profiles(self, model_id: str = "") -> list[VoiceProfile]:
+        if self._uses_layered_config():
+            profiles: list[VoiceProfile] = []
+            voice_sets = self.list_voice_sets()
+            target_set_id = self.normalize_voice_set_id(model_id) if strip_text(model_id) else ""
+            for voice_set in voice_sets:
+                if target_set_id and voice_set.id != target_set_id:
+                    continue
+                for voice_id in voice_set.voices or []:
+                    profile = self._read_voice_profile(voice_id, voice_set)
+                    if profile is not None:
+                        profiles.append(profile)
+            return profiles
+
         profiles = []
         for payload in self._read_payload():
             if not isinstance(payload, dict):
@@ -449,17 +717,17 @@ class VoiceRegistry:
             profiles.append(VoiceProfile.from_mapping(payload, repo_dir=self.repo_dir))
         return profiles
 
-    def get(self, voice_id: str) -> Optional[VoiceProfile]:
+    def get(self, voice_id: str, *, model_id: str = "") -> Optional[VoiceProfile]:
         voice_id = strip_text(voice_id)
         if not voice_id:
             return None
-        for profile in self.list_profiles():
+        for profile in self.list_profiles(model_id):
             if voice_id in {profile.id, profile.name}:
                 return profile
         return None
 
-    def first(self) -> Optional[VoiceProfile]:
-        profiles = self.list_profiles()
+    def first(self, model_id: str = "") -> Optional[VoiceProfile]:
+        profiles = self.list_profiles(model_id)
         return profiles[0] if profiles else None
 
 
@@ -921,12 +1189,13 @@ def request_with_profile(
     default_voice_id: str = "",
 ) -> tuple[dict[str, Any], Optional[VoiceProfile]]:
     data = model_dump(payload)
+    model_id = strip_text(data.get("model"))
     voice_id = extract_voice_id(data.get("voice"))
     if voice_id in {"", "default"} and strip_text(default_voice_id):
         voice_id = strip_text(default_voice_id)
-    profile = registry.get(voice_id)
+    profile = registry.get(voice_id, model_id=model_id)
     if profile is None and voice_id in {"", "default"}:
-        profile = registry.first()
+        profile = registry.first(model_id)
 
     text = first_non_empty(data.get("input"), data.get("text"))
     response_format = require_supported_format(data.get("response_format") or "mp3")
@@ -954,7 +1223,7 @@ def request_with_profile(
         "text_split_method": data.get("text_split_method", "cut5"),
         "batch_size": data.get("batch_size", 1),
         "batch_threshold": 0.75,
-        "speed_factor": data.get("speed", 1.0),
+        "speed_factor": data.get("speed") or (profile.speed if profile else 1.0),
         "fragment_interval": 0.3,
         "seed": data.get("seed", -1),
         "media_type": response_format,
@@ -1039,39 +1308,7 @@ def request_with_clone(
 
 
 def native_model_catalog(registry: VoiceRegistry) -> list[dict[str, Any]]:
-    grouped: dict[str, dict[str, Any]] = {}
-    for profile in registry.list_profiles():
-        model_id = first_non_empty(
-            getattr(profile, "model_id", ""),
-            profile.description.split(" from ", 1)[1].split(" ", 1)[0] if " from " in profile.description else "",
-            "custom-trained",
-        )
-        model_name = first_non_empty(getattr(profile, "model_name", ""), model_id)
-        model = grouped.setdefault(
-            model_id,
-            {
-                "id": model_id,
-                "object": "gpt_sovits.model",
-                "type": profile.model_type or "trained",
-                "name": model_name,
-                "voices": [],
-            },
-        )
-        model["voices"].append(profile.to_native_voice(model_id=model_id))
-
-    return [
-        *grouped.values(),
-        {
-            "id": "gpt-sovits-v2proplus-clone",
-            "object": "gpt_sovits.model",
-            "type": "clone",
-            "name": "GPT-SoVITS v2ProPlus Clone",
-            "voices": [],
-            "requires_reference_audio": True,
-            "gpt_weights_path": str(DEFAULT_CLONE_GPT_WEIGHTS),
-            "sovits_weights_path": str(DEFAULT_CLONE_SOVITS_WEIGHTS),
-        },
-    ]
+    return [preset.to_native_model() for preset in registry.list_model_presets()]
 
 
 def audio_response(
@@ -1212,6 +1449,7 @@ def create_api_app(
     *,
     default_voice_id: str = "",
     rtf_log: bool = False,
+    admin_url: str = "",
 ) -> FastAPI:
     app = FastAPI(
         title="Neiroha GPT-SoVITS Launcher",
@@ -1236,7 +1474,7 @@ def create_api_app(
             "native_clone_upload": "/gpt-sovits/clone/upload",
             "capabilities": "/gpt-sovits/capabilities",
             "native_speech": "/tts",
-            "admin": "/admin",
+            "admin": admin_url or "/admin",
         }
 
     @app.get("/health")
@@ -1244,24 +1482,21 @@ def create_api_app(
     def health():
         return {
             "status": "ok",
-            "default_voice": strip_text(default_voice_id) or "default",
+            "active_voice_set": registry.active_voice_set_id(),
+            "active_model_preset": registry.active_model_preset_id(),
+            "default_voice": strip_text(default_voice_id) or registry.default_voice_id(),
+            "admin_url": admin_url,
             **runtime.status(),
         }
 
     @app.get("/v1/models")
     def list_models():
-        status = runtime.status()
+        voice_sets = registry.list_voice_sets()
         return {
             "object": "list",
             "data": [
-                {
-                    "id": OPENAI_MODEL_ALIAS,
-                    "object": "model",
-                    "owned_by": "local",
-                    "root_model": "RVC-Boss/GPT-SoVITS",
-                    "loaded": status["loaded"],
-                    "version": status["version"],
-                }
+                voice_set.to_openai_model(len(registry.list_profiles(voice_set.id)))
+                for voice_set in voice_sets
             ],
         }
 
@@ -1273,12 +1508,23 @@ def create_api_app(
             voices = [
                 {
                     "id": "default",
+                    "voice_id": "default",
                     "name": "default",
                     "object": "voice",
-                    "description": "Configure profiles/voices.json or pass ref_audio_path in the request.",
+                    "model": registry.active_voice_set_id(),
+                    "task_mode": "prompt_clone",
+                    "description": "Configure runtime/voices/<voice-id>/voice.json or pass ref_audio_path in the request.",
                 }
             ]
-        return {"object": "list", "data": voices}
+        compact = [
+            {
+                "voice_id": item["voice_id"],
+                "name": item["name"],
+                "model": item.get("model", registry.active_voice_set_id()),
+            }
+            for item in voices
+        ]
+        return {"object": "list", "data": voices, "voices": compact}
 
     @app.get("/gpt-sovits/models")
     def list_native_models():
@@ -1289,7 +1535,7 @@ def create_api_app(
         profiles = registry.list_profiles()
         data = []
         for profile in profiles:
-            current_model_id = first_non_empty(profile.model_id, "custom-trained")
+            current_model_id = first_non_empty(profile.model_preset, DEFAULT_MODEL_PRESET_ID)
             if model_id and model_id != current_model_id:
                 continue
             data.append(profile.to_native_voice(model_id=current_model_id))
@@ -1325,11 +1571,12 @@ def create_api_app(
                 "normalized_seconds": [CLONE_REFERENCE_MIN_SECONDS, CLONE_REFERENCE_MAX_SECONDS],
             },
             "logging": {
-                "runtime_events": "/gpt-sovits/events",
-                "event_log_path": str(RUNTIME_EVENT_LOG_PATH),
+                "runtime_log": "/gpt-sovits/logs",
+                "log_path": str(RUNTIME_EVENT_LOG_PATH),
                 "raw_runtime_output_default": "suppressed",
                 "raw_runtime_output_debug_log": str(RUNTIME_DEBUG_LOG_PATH),
             },
+            "admin_url": admin_url,
         }
 
     @app.get("/speakers")
@@ -1344,7 +1591,18 @@ def create_api_app(
         return {
             **runtime.status(),
             "profiles_path": str(registry.profile_path),
-            "default_voice": strip_text(default_voice_id) or "default",
+            "server_config_path": str(registry.server_config_path),
+            "voice_sets_dir": str(registry.voice_sets_dir),
+            "model_presets_dir": str(registry.model_presets_dir),
+            "runtime_voices_dir": str(registry.runtime_voices_dir),
+            "active_voice_set": registry.active_voice_set_id(),
+            "active_model_preset": registry.active_model_preset_id(),
+            "default_voice": strip_text(default_voice_id) or registry.default_voice_id(),
+            "admin_url": admin_url,
+            "voice_sets": [
+                item.to_openai_model(len(registry.list_profiles(item.id)))
+                for item in registry.list_voice_sets()
+            ],
             "voices": [profile.to_openai_voice() for profile in registry.list_profiles()],
             "native_models": native_model_catalog(registry),
             "routes": {
@@ -1357,6 +1615,7 @@ def create_api_app(
                 "capabilities": "/gpt-sovits/capabilities",
                 "models": "/v1/models",
                 "voices": "/v1/audio/voices",
+                "logs": "/gpt-sovits/logs",
                 "load": "/gpt-sovits/load",
                 "unload": "/gpt-sovits/unload",
                 "set_gpt_weights": "/set_gpt_weights",
@@ -1367,16 +1626,23 @@ def create_api_app(
     @app.get("/gpt-sovits/events")
     def runtime_events(limit: int = Query(80, ge=1, le=500)):
         return {
-            "object": "list",
+            "object": "log",
             "path": str(RUNTIME_EVENT_LOG_PATH),
             "data": RUNTIME_EVENTS.tail(limit),
         }
 
+    @app.get("/gpt-sovits/logs")
+    def runtime_logs(limit: int = Query(120, ge=1, le=1000)):
+        return Response(
+            content=RUNTIME_EVENTS.tail(limit),
+            media_type="text/plain; charset=utf-8",
+        )
+
     @app.post("/v1/audio/speech")
     def openai_audio_speech(payload: OpenAISpeechRequest):
-        if payload.model and payload.model not in {OPENAI_MODEL_ALIAS, "tts-1", "tts-1-hd"}:
+        if payload.model and payload.model not in LEGACY_OPENAI_MODEL_ALIASES and not registry.has_voice_set(payload.model):
             return openai_error(
-                f"This launcher serves '{OPENAI_MODEL_ALIAS}'. Received model='{payload.model}'.",
+                f"Unknown voice set model='{payload.model}'. Use GET /v1/models.",
                 status_code=400,
             )
         if payload.stream_format not in {"", "audio"}:
@@ -1395,7 +1661,7 @@ def create_api_app(
             speaker = profile.id if profile else extract_voice_id(payload.voice) or default_voice_id or "default"
             metrics = log_rtf(
                 rtf_log,
-                mode="trained",
+                mode=profile.model_type if profile else "prompt_clone",
                 speaker=speaker,
                 sample_rate=sample_rate,
                 audio_data=audio_data,
@@ -1412,9 +1678,9 @@ def create_api_app(
 
     @app.post("/gpt-sovits/clone")
     def clone_audio_speech(payload: CloneSpeechRequest):
-        if payload.model and payload.model not in {OPENAI_MODEL_ALIAS, "tts-1", "tts-1-hd"}:
+        if payload.model and payload.model not in {OPENAI_MODEL_ALIAS, *LEGACY_OPENAI_MODEL_ALIASES}:
             return openai_error(
-                f"This launcher serves '{OPENAI_MODEL_ALIAS}'. Received model='{payload.model}'.",
+                f"This clone route serves '{OPENAI_MODEL_ALIAS}'. Received model='{payload.model}'.",
                 status_code=400,
             )
 
@@ -2112,13 +2378,13 @@ class ManagedDownloadProcess:
             except OSError as exc:
                 chunks.append(f"[{label}] unable to read {path}: {exc}")
                 continue
-            tail_text = "\n".join(text.splitlines()[-lines:])
+            tail_text = "\n".join(reversed(text.splitlines()[-lines:]))
             if tail_text:
-                chunks.append(f"[{label}] {path}\n{tail_text}")
+                chunks.append(f"[{label}] {path} (newest first)\n{tail_text}")
         return "\n\n".join(chunks) or "No download logs yet."
 
 
-def build_gradio_admin_blocks(
+def build_gradio_admin_blocks_legacy(
     api_base: str,
     registry: VoiceRegistry,
     *,
@@ -2129,6 +2395,170 @@ def build_gradio_admin_blocks(
 
     base = api_base.rstrip("/")
     download_manager = ManagedDownloadProcess()
+    ui_config: dict[str, Any] = {}
+    if UI_CONFIG_PATH.exists():
+        with UI_CONFIG_PATH.open("rb") as file:
+            ui_config = tomllib.load(file)
+    language = strip_text(os.environ.get("NEIROHA_GPT_SOVITS_UI_LANG") or ui_config.get("default_language") or "zh")
+    language = "en" if language.lower().startswith("en") else "zh"
+    ui_title = strip_text(ui_config.get("title")) or "Neiroha GPT-SoVITS Admin"
+    ui_text = {
+        "zh": {
+            "api_offline": "### API 离线\n",
+            "api_online": "### API 在线\n",
+            "api_base": "API Base",
+            "refresh_time": "刷新时间",
+            "error": "错误",
+            "wait_preload": "如果是从 `start_api_admin.bat` 启动，等预加载完成后这里会自动刷新。",
+            "loaded": "已加载",
+            "not_loaded": "未加载",
+            "model_status": "模型状态",
+            "device": "设备",
+            "half": "半精度",
+            "available_model": "可用 model",
+            "available_voice": "可用 voice",
+            "gpt_weights": "GPT 权重",
+            "sovits_weights": "SoVITS 权重",
+            "external_process": "API 进程由外层 launcher / start_api_admin.bat 管理；此 Admin 只连接并显示状态。",
+            "home": "首页",
+            "trial": "试音",
+            "clone_config": "克隆配置",
+            "model_presets": "Model Presets",
+            "download": "下载",
+            "logs": "日志",
+            "runtime_status": "运行状态",
+            "api_process": "API 进程",
+            "refresh": "刷新",
+            "load_active": "加载当前 preset",
+            "unload_model": "卸载模型",
+            "preload": "预加载",
+            "default_voice": "默认 voice",
+            "start_api": "启动 API",
+            "stop_api": "停止 API",
+            "voice_set_model": "voice set / model",
+            "voice": "voice",
+            "text": "文本",
+            "format": "格式",
+            "speed": "速度",
+            "generate": "生成",
+            "audio_output": "输出音频",
+            "metrics": "RTF / 输出",
+            "save_to_voice_set": "保存到 voice set",
+            "use_model_preset": "使用 model preset",
+            "voice_id": "voice id",
+            "name": "name",
+            "upload_reference": "上传参考音频",
+            "reference_path": "或填写参考音频路径",
+            "prompt_text": "prompt_text",
+            "prompt_lang": "prompt_lang",
+            "text_lang": "text_lang",
+            "default_speed": "默认速度",
+            "trained_weight_override": "可选：覆盖为别人训练过的 GPT/SoVITS 权重",
+            "gpt_ckpt": "GPT 权重 .ckpt",
+            "sovits_pth": "SoVITS 权重 .pth",
+            "save_voice": "保存 voice",
+            "save_result": "保存结果",
+            "current_preset": "当前底层 preset",
+            "load": "加载",
+            "unload": "卸载",
+            "reload": "重载",
+            "preset_status": "Presets / 状态",
+            "new_preset": "新增 / 更新训练模型 preset",
+            "save_preset": "保存 preset",
+            "config_path": "config_path",
+            "download_source": "下载源",
+            "force_redownload": "强制重新下载",
+            "download_base": "下载预训练基座",
+            "download_v2pro": "下载 v2ProPlus 克隆基座",
+            "download_sample": "下载单个示例参考音频",
+            "refresh_log": "刷新日志",
+            "stop_download": "停止下载",
+            "download_status": "下载状态 / 日志",
+            "backend_log": "backend.log（最新在上，自动刷新）",
+            "prompt_required": "prompt_text is required.",
+            "reference_required": "reference audio is required.",
+            "weights_required": "GPT 权重和 SoVITS 权重路径都要填。",
+        },
+        "en": {
+            "api_offline": "### API Offline\n",
+            "api_online": "### API Online\n",
+            "api_base": "API Base",
+            "refresh_time": "Refreshed",
+            "error": "Error",
+            "wait_preload": "If launched from `start_api_admin.bat`, this panel will refresh automatically after preload finishes.",
+            "loaded": "loaded",
+            "not_loaded": "not loaded",
+            "model_status": "Model",
+            "device": "Device",
+            "half": "Half",
+            "available_model": "Models",
+            "available_voice": "Voices",
+            "gpt_weights": "GPT weights",
+            "sovits_weights": "SoVITS weights",
+            "external_process": "The API process is managed by the outer launcher / start_api_admin.bat; this Admin only connects to it.",
+            "home": "Home",
+            "trial": "Test Voice",
+            "clone_config": "Voice Config",
+            "model_presets": "Model Presets",
+            "download": "Downloads",
+            "logs": "Logs",
+            "runtime_status": "Runtime Status",
+            "api_process": "API Process",
+            "refresh": "Refresh",
+            "load_active": "Load Active Preset",
+            "unload_model": "Unload Model",
+            "preload": "Preload",
+            "default_voice": "Default voice",
+            "start_api": "Start API",
+            "stop_api": "Stop API",
+            "voice_set_model": "voice set / model",
+            "voice": "voice",
+            "text": "Text",
+            "format": "Format",
+            "speed": "Speed",
+            "generate": "Generate",
+            "audio_output": "Output audio",
+            "metrics": "RTF / Output",
+            "save_to_voice_set": "Save to voice set",
+            "use_model_preset": "Use model preset",
+            "voice_id": "voice id",
+            "name": "name",
+            "upload_reference": "Upload reference audio",
+            "reference_path": "Or reference audio path",
+            "prompt_text": "prompt_text",
+            "prompt_lang": "prompt_lang",
+            "text_lang": "text_lang",
+            "default_speed": "Default speed",
+            "trained_weight_override": "Optional: override with trained GPT/SoVITS weights",
+            "gpt_ckpt": "GPT weights .ckpt",
+            "sovits_pth": "SoVITS weights .pth",
+            "save_voice": "Save voice",
+            "save_result": "Save result",
+            "current_preset": "Current runtime preset",
+            "load": "Load",
+            "unload": "Unload",
+            "reload": "Reload",
+            "preset_status": "Presets / Status",
+            "new_preset": "Add / Update Trained Model Preset",
+            "save_preset": "Save preset",
+            "config_path": "config_path",
+            "download_source": "Download source",
+            "force_redownload": "Force redownload",
+            "download_base": "Download pretrained base",
+            "download_v2pro": "Download v2ProPlus clone base",
+            "download_sample": "Download single sample reference",
+            "refresh_log": "Refresh logs",
+            "stop_download": "Stop download",
+            "download_status": "Download status / logs",
+            "backend_log": "backend.log (newest first, auto-refresh)",
+            "prompt_required": "prompt_text is required.",
+            "reference_required": "reference audio is required.",
+            "weights_required": "GPT and SoVITS weight paths are both required.",
+        },
+    }[language]
+
+    def t(key: str) -> str:
+        return ui_text.get(key, key)
 
     def api_url(path: str) -> str:
         return f"{base}{path if path.startswith('/') else '/' + path}"
@@ -3219,23 +3649,752 @@ def build_gradio_admin_blocks(
     return blocks.queue(max_size=8, default_concurrency_limit=1)
 
 
+def build_gradio_admin_blocks(
+    api_base: str,
+    registry: VoiceRegistry,
+    *,
+    process_manager: Optional[ManagedApiProcess] = None,
+):
+    import gradio as gr
+    import requests
+
+    base = api_base.rstrip("/")
+    download_manager = ManagedDownloadProcess()
+    ui_config: dict[str, Any] = {}
+    if UI_CONFIG_PATH.exists():
+        with UI_CONFIG_PATH.open("rb") as file:
+            ui_config = tomllib.load(file)
+    language = strip_text(os.environ.get("NEIROHA_GPT_SOVITS_UI_LANG") or ui_config.get("default_language") or "zh")
+    language = "en" if language.lower().startswith("en") else "zh"
+    ui_title = strip_text(ui_config.get("title")) or "Neiroha GPT-SoVITS Admin"
+    ui_text = {
+        "zh": {
+            "api_offline": "### API 离线\n",
+            "api_online": "### API 在线\n",
+            "api_base": "API Base",
+            "refresh_time": "刷新时间",
+            "error": "错误",
+            "wait_preload": "如果是从 `start_api_admin.bat` 启动，等预加载完成后这里会自动刷新。",
+            "loaded": "已加载",
+            "not_loaded": "未加载",
+            "model_status": "模型状态",
+            "device": "设备",
+            "half": "半精度",
+            "active_preset": "当前 preset",
+            "active_voice_set": "当前 voice set",
+            "default_voice": "默认 voice",
+            "available_model": "可用 model",
+            "available_voice": "可用 voice",
+            "gpt_weights": "GPT 权重",
+            "sovits_weights": "SoVITS 权重",
+            "external_process": "API 进程由外层 launcher / start_api_admin.bat 管理；此 Admin 只连接并显示状态。",
+            "home": "首页",
+            "trial": "试音",
+            "clone_config": "克隆配置",
+            "model_presets": "Model Presets",
+            "download": "下载",
+            "logs": "日志",
+            "runtime_status": "运行状态",
+            "api_process": "API 进程",
+            "refresh": "刷新",
+            "load_active": "加载当前 preset",
+            "unload_model": "卸载模型",
+            "preload": "预加载",
+            "start_api": "启动 API",
+            "stop_api": "停止 API",
+            "voice_set_model": "voice set / model",
+            "voice": "voice",
+            "text": "文本",
+            "format": "格式",
+            "speed": "速度",
+            "generate": "生成",
+            "audio_output": "输出音频",
+            "metrics": "RTF / 输出",
+            "save_to_voice_set": "保存到 voice set",
+            "use_model_preset": "使用 model preset",
+            "voice_id": "voice id",
+            "name": "name",
+            "upload_reference": "上传参考音频",
+            "reference_path": "或填写参考音频路径",
+            "prompt_text": "prompt_text",
+            "prompt_lang": "prompt_lang",
+            "text_lang": "text_lang",
+            "default_speed": "默认速度",
+            "trained_weight_override": "可选：覆盖为别人训练过的 GPT/SoVITS 权重",
+            "gpt_ckpt": "GPT 权重 .ckpt",
+            "sovits_pth": "SoVITS 权重 .pth",
+            "save_voice": "保存 voice",
+            "save_result": "保存结果",
+            "voice_sets": "Voice Sets",
+            "current_preset": "当前底层 preset",
+            "load": "加载",
+            "unload": "卸载",
+            "reload": "重载",
+            "preset_status": "Presets / 状态",
+            "new_preset": "新增 / 更新训练模型 preset",
+            "preset_id": "preset id",
+            "save_preset": "保存 preset",
+            "config_path": "config_path",
+            "download_source": "下载源",
+            "force_redownload": "强制重新下载",
+            "download_base": "下载预训练基座",
+            "download_v2pro": "下载 v2ProPlus 克隆基座",
+            "download_sample": "下载单个示例参考音频",
+            "refresh_log": "刷新日志",
+            "stop_download": "停止下载",
+            "download_status": "下载状态 / 日志",
+            "backend_log": "backend.log（最新在上，自动刷新）",
+            "prompt_required": "prompt_text is required.",
+            "reference_required": "reference audio is required.",
+            "weights_required": "GPT 权重和 SoVITS 权重路径都要填。",
+            "saved_model_preset": "已保存模型 preset",
+            "saved_voice_profile": "已保存 voice 配置",
+            "pretrained_base_assets": "预训练基座资源",
+            "v2pro_clone_base": "v2ProPlus 克隆基座",
+            "single_sample_reference": "单个示例参考音频",
+            "log_endpoint_unavailable": "API 日志接口不可用",
+        },
+        "en": {
+            "api_offline": "### API Offline\n",
+            "api_online": "### API Online\n",
+            "api_base": "API Base",
+            "refresh_time": "Refreshed",
+            "error": "Error",
+            "wait_preload": "If launched from `start_api_admin.bat`, this panel will refresh automatically after preload finishes.",
+            "loaded": "loaded",
+            "not_loaded": "not loaded",
+            "model_status": "Model",
+            "device": "Device",
+            "half": "Half",
+            "active_preset": "Active preset",
+            "active_voice_set": "Voice set",
+            "default_voice": "Default voice",
+            "available_model": "Models",
+            "available_voice": "Voices",
+            "gpt_weights": "GPT weights",
+            "sovits_weights": "SoVITS weights",
+            "external_process": "The API process is managed by the outer launcher / start_api_admin.bat; this Admin only connects to it.",
+            "home": "Home",
+            "trial": "Test Voice",
+            "clone_config": "Voice Config",
+            "model_presets": "Model Presets",
+            "download": "Downloads",
+            "logs": "Logs",
+            "runtime_status": "Runtime Status",
+            "api_process": "API Process",
+            "refresh": "Refresh",
+            "load_active": "Load Active Preset",
+            "unload_model": "Unload Model",
+            "preload": "Preload",
+            "start_api": "Start API",
+            "stop_api": "Stop API",
+            "voice_set_model": "voice set / model",
+            "voice": "voice",
+            "text": "Text",
+            "format": "Format",
+            "speed": "Speed",
+            "generate": "Generate",
+            "audio_output": "Output audio",
+            "metrics": "RTF / Output",
+            "save_to_voice_set": "Save to voice set",
+            "use_model_preset": "Use model preset",
+            "voice_id": "voice id",
+            "name": "name",
+            "upload_reference": "Upload reference audio",
+            "reference_path": "Or reference audio path",
+            "prompt_text": "prompt_text",
+            "prompt_lang": "prompt_lang",
+            "text_lang": "text_lang",
+            "default_speed": "Default speed",
+            "trained_weight_override": "Optional: override with trained GPT/SoVITS weights",
+            "gpt_ckpt": "GPT weights .ckpt",
+            "sovits_pth": "SoVITS weights .pth",
+            "save_voice": "Save voice",
+            "save_result": "Save result",
+            "voice_sets": "Voice Sets",
+            "current_preset": "Current runtime preset",
+            "load": "Load",
+            "unload": "Unload",
+            "reload": "Reload",
+            "preset_status": "Presets / Status",
+            "new_preset": "Add / Update Trained Model Preset",
+            "preset_id": "preset id",
+            "save_preset": "Save preset",
+            "config_path": "config_path",
+            "download_source": "Download source",
+            "force_redownload": "Force redownload",
+            "download_base": "Download pretrained base",
+            "download_v2pro": "Download v2ProPlus clone base",
+            "download_sample": "Download single sample reference",
+            "refresh_log": "Refresh logs",
+            "stop_download": "Stop download",
+            "download_status": "Download status / logs",
+            "backend_log": "backend.log (newest first, auto-refresh)",
+            "prompt_required": "prompt_text is required.",
+            "reference_required": "reference audio is required.",
+            "weights_required": "GPT and SoVITS weight paths are both required.",
+            "saved_model_preset": "Saved model preset",
+            "saved_voice_profile": "Saved voice profile",
+            "pretrained_base_assets": "pretrained base assets",
+            "v2pro_clone_base": "v2ProPlus clone base",
+            "single_sample_reference": "single sample reference voice",
+            "log_endpoint_unavailable": "API log endpoint unavailable",
+        },
+    }[language]
+
+    def t(key: str) -> str:
+        return ui_text.get(key, key)
+
+    def api_url(path: str) -> str:
+        return f"{base}{path if path.startswith('/') else '/' + path}"
+
+    def request_json(method: str, path: str, **kwargs: Any) -> str:
+        response = requests.request(method, api_url(path), timeout=20, **kwargs)
+        try:
+            payload = response.json()
+        except Exception:
+            payload = response.text
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def request_payload(method: str, path: str, timeout: int = 5, **kwargs: Any) -> Any:
+        response = requests.request(method, api_url(path), timeout=timeout, **kwargs)
+        response.raise_for_status()
+        return response.json()
+
+    def request_text(method: str, path: str, timeout: int = 5, **kwargs: Any) -> str:
+        response = requests.request(method, api_url(path), timeout=timeout, **kwargs)
+        response.raise_for_status()
+        return response.text
+
+    def home_status() -> str:
+        now = dt.datetime.now().strftime("%H:%M:%S")
+        try:
+            health = request_payload("GET", "/health", timeout=2)
+            models = request_payload("GET", "/v1/models", timeout=2).get("data", [])
+            voices = request_payload("GET", "/v1/audio/voices", timeout=2).get("data", [])
+        except Exception as exc:
+            return (
+                t("api_offline")
+                + f"- {t('api_base')}: `{base}`\n"
+                + f"- {t('refresh_time')}: `{now}`\n"
+                + f"- {t('error')}: `{exc}`\n"
+                + f"- {t('wait_preload')}"
+            )
+
+        loaded = t("loaded") if health.get("loaded") else t("not_loaded")
+        device = health.get("device") or "-"
+        is_half = health.get("is_half")
+        active_preset = health.get("active_model_preset") or registry.active_model_preset_id()
+        active_set = health.get("active_voice_set") or registry.active_voice_set_id()
+        default_voice = health.get("default_voice") or registry.default_voice_id()
+        gpt_weights = health.get("gpt_weights_path") or "-"
+        sovits_weights = health.get("sovits_weights_path") or "-"
+        voice_list = ", ".join(strip_text(item.get("voice_id") or item.get("id")) for item in voices) or "-"
+        model_list = ", ".join(strip_text(item.get("id")) for item in models) or "-"
+        return (
+            t("api_online")
+            + f"- {t('api_base')}: `{base}`\n"
+            + f"- {t('refresh_time')}: `{now}`\n"
+            + f"- {t('model_status')}: `{loaded}`  {t('device')}: `{device}`  {t('half')}: `{is_half}`\n"
+            f"- {t('active_preset')}: `{active_preset}`\n"
+            f"- {t('active_voice_set')}: `{active_set}`  {t('default_voice')}: `{default_voice}`\n"
+            f"- {t('available_model')}: `{model_list}`\n"
+            f"- {t('available_voice')}: `{voice_list}`\n"
+            f"- {t('gpt_weights')}: `{gpt_weights}`\n"
+            f"- {t('sovits_weights')}: `{sovits_weights}`"
+        )
+
+    def process_status() -> str:
+        now = dt.datetime.now().strftime("%H:%M:%S")
+        if process_manager:
+            status = process_manager.status()
+        else:
+            status = t("external_process")
+        return f"{status}\n{t('api_base')}: {base}\n{t('refresh_time')}: {now}"
+
+    def home_refresh() -> tuple[str, str]:
+        return home_status(), process_status()
+
+    def start_api(default_voice: str, preload: bool) -> tuple[str, str]:
+        if process_manager is None:
+            return process_status(), home_status()
+        return process_manager.start(default_voice, preload), home_status()
+
+    def stop_api() -> tuple[str, str]:
+        if process_manager is None:
+            return process_status(), home_status()
+        return process_manager.stop(), home_status()
+
+    def model_choices() -> list[str]:
+        try:
+            data = requests.get(api_url("/v1/models"), timeout=2).json().get("data", [])
+            choices = [strip_text(item.get("id")) for item in data if strip_text(item.get("id"))]
+            return choices or [registry.active_voice_set_id()]
+        except Exception:
+            return [voice_set.id for voice_set in registry.list_voice_sets()]
+
+    def voice_choices(model_id: str = "") -> list[str]:
+        try:
+            data = requests.get(api_url("/v1/audio/voices"), timeout=2).json().get("data", [])
+            choices = [
+                strip_text(item.get("voice_id") or item.get("id"))
+                for item in data
+                if not model_id or item.get("model") == model_id
+            ]
+            return choices or [registry.default_voice_id()]
+        except Exception:
+            return [profile.id for profile in registry.list_profiles(model_id)] or [registry.default_voice_id()]
+
+    def refresh_choices(model_id: str):
+        models = model_choices()
+        selected_model = model_id if model_id in models else models[0]
+        voices = voice_choices(selected_model)
+        selected_voice = voices[0] if voices else registry.default_voice_id()
+        return gr.update(choices=models, value=selected_model), gr.update(choices=voices, value=selected_voice)
+
+    def refresh_voice_dropdown(model_id: str):
+        voices = voice_choices(model_id)
+        return gr.update(choices=voices, value=voices[0] if voices else registry.default_voice_id())
+
+    def synthesize_preview(model_id: str, voice_id: str, text: str, response_format: str, speed: float):
+        payload = {
+            "model": model_id or registry.active_voice_set_id(),
+            "voice": voice_id or registry.default_voice_id(),
+            "input": text,
+            "response_format": response_format or "wav",
+            "speed": speed or 1.0,
+        }
+        response = requests.post(api_url("/v1/audio/speech"), json=payload, timeout=600)
+        if response.status_code >= 400:
+            return None, response.text
+        output_path = response.headers.get("X-Neiroha-Output-Path")
+        if not output_path:
+            suffix = require_supported_format(response_format or "wav")
+            output_path = str(OUTPUT_ROOT / f"admin_preview_{dt.datetime.now().strftime('%Y%m%d%H%M%S')}.{suffix}")
+            Path(output_path).write_bytes(response.content)
+        metrics = {
+            "output_path": output_path,
+            "audio_seconds": response.headers.get("X-Neiroha-Audio-Seconds", ""),
+            "elapsed_seconds": response.headers.get("X-Neiroha-Elapsed-Seconds", ""),
+            "rtf": response.headers.get("X-Neiroha-RTF", ""),
+        }
+        return output_path, json.dumps(metrics, ensure_ascii=False, indent=2)
+
+    def presets_text() -> str:
+        return json.dumps(
+            {"data": [preset.to_native_model() for preset in registry.list_model_presets()]},
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    def voice_sets_text() -> str:
+        return json.dumps(
+            {
+                "active_voice_set": registry.active_voice_set_id(),
+                "default_voice": registry.default_voice_id(),
+                "data": [
+                    voice_set.to_openai_model(len(registry.list_profiles(voice_set.id)))
+                    | {"voices": voice_set.voices or []}
+                    for voice_set in registry.list_voice_sets()
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    def load_preset(preset_id: str) -> str:
+        preset = registry.get_model_preset(preset_id)
+        return request_json(
+            "POST",
+            "/gpt-sovits/load",
+            json={
+                "config_path": preset.config_path,
+                "gpt_weights_path": preset.gpt_weights_path,
+                "sovits_weights_path": preset.sovits_weights_path,
+            },
+        )
+
+    def load_active_preset() -> str:
+        return load_preset(registry.active_model_preset_id())
+
+    def load_active_and_refresh() -> tuple[str, str]:
+        load_active_preset()
+        return home_refresh()
+
+    def unload_model() -> str:
+        return request_json("POST", "/gpt-sovits/unload")
+
+    def unload_and_refresh() -> tuple[str, str]:
+        unload_model()
+        return home_refresh()
+
+    def reload_preset(preset_id: str) -> str:
+        preset = registry.get_model_preset(preset_id)
+        return request_json(
+            "POST",
+            "/gpt-sovits/reload",
+            json={
+                "config_path": preset.config_path,
+                "gpt_weights_path": preset.gpt_weights_path,
+                "sovits_weights_path": preset.sovits_weights_path,
+            },
+        )
+
+    def write_model_preset(
+        preset_id: str,
+        preset_name: str,
+        config_path: str,
+        gpt_weights_path: str,
+        sovits_weights_path: str,
+    ) -> tuple[str, Any, Any]:
+        preset_id = safe_filename_part(preset_id, fallback="trained-preset")
+        preset_name = strip_text(preset_name) or preset_id
+        config_path = strip_text(config_path) or profile_path_text(DEFAULT_CONFIG_PATH)
+        gpt_weights_path = strip_text(gpt_weights_path)
+        sovits_weights_path = strip_text(sovits_weights_path)
+        if not gpt_weights_path or not sovits_weights_path:
+            raise gr.Error(t("weights_required"))
+
+        preset_path = MODEL_PRESETS_DIR / f"{preset_id}.toml"
+        preset_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path_text = config_path.replace("\\", "/")
+        gpt_weights_text = gpt_weights_path.replace("\\", "/")
+        sovits_weights_text = sovits_weights_path.replace("\\", "/")
+        toml_string = lambda value: json.dumps(str(value), ensure_ascii=False)
+        preset_path.write_text(
+            "\n".join(
+                [
+                    "schema_version = 1",
+                    f"id = {toml_string(preset_id)}",
+                    f"name = {toml_string(preset_name)}",
+                    'engine = "gpt-sovits"',
+                    "",
+                    "[gpt_sovits]",
+                    f"config_path = {toml_string(config_path_text)}",
+                    f"gpt_weights_path = {toml_string(gpt_weights_text)}",
+                    f"sovits_weights_path = {toml_string(sovits_weights_text)}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        choices = [preset.id for preset in registry.list_model_presets()]
+        status = f"{t('saved_model_preset')}: {profile_path_text(preset_path)}"
+        return status, gr.update(choices=choices, value=preset_id), gr.update(choices=choices, value=preset_id)
+
+    def write_voice_profile(
+        voice_set_id: str,
+        model_preset_id: str,
+        voice_id: str,
+        voice_name: str,
+        ref_audio_file: Optional[str],
+        ref_audio_path: str,
+        prompt_text: str,
+        prompt_lang: str,
+        text_lang: str,
+        speed: float,
+        gpt_weights_path: str,
+        sovits_weights_path: str,
+    ) -> tuple[str, str, Any, Any]:
+        voice_id = safe_filename_part(voice_id, fallback="local-voice")
+        voice_name = strip_text(voice_name) or voice_id
+        prompt_text = strip_text(prompt_text)
+        if not prompt_text:
+            raise gr.Error(t("prompt_required"))
+        voice_set_id = strip_text(voice_set_id) or registry.active_voice_set_id()
+        model_preset_id = strip_text(model_preset_id) or registry.active_model_preset_id()
+        voice_dir = RUNTIME_VOICES_ROOT / voice_id
+        voice_dir.mkdir(parents=True, exist_ok=True)
+
+        reference_audio = strip_text(ref_audio_path)
+        if ref_audio_file:
+            source = Path(ref_audio_file)
+            suffix = source.suffix or ".wav"
+            target = voice_dir / f"reference{suffix}"
+            shutil.copyfile(source, target)
+            reference_audio = profile_path_text(target)
+        if not reference_audio:
+            raise gr.Error(t("reference_required"))
+
+        payload = {
+            "schema_version": 1,
+            "id": voice_id,
+            "name": voice_name,
+            "mode": "prompt_clone",
+            "model_preset": model_preset_id,
+            "reference_audio": reference_audio,
+            "prompt_audio": "",
+            "prompt_text": prompt_text,
+            "text_lang": strip_text(text_lang) or "zh",
+            "prompt_lang": strip_text(prompt_lang) or "zh",
+            "instruction": "",
+            "speed": float(speed or 1.0),
+            "engine_options": {},
+        }
+        if strip_text(gpt_weights_path) or strip_text(sovits_weights_path):
+            payload["gpt_weights_path"] = strip_text(gpt_weights_path)
+            payload["sovits_weights_path"] = strip_text(sovits_weights_path)
+        (voice_dir / "voice.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        voice_set_path = VOICE_SETS_DIR / f"{voice_set_id}.json"
+        if voice_set_path.exists():
+            voice_set_payload = json.loads(voice_set_path.read_text(encoding="utf-8-sig"))
+        else:
+            voice_set_payload = {
+                "schema_version": 1,
+                "id": voice_set_id,
+                "name": voice_set_id,
+                "description": "Local voice set.",
+                "voices": [],
+            }
+        voices = [
+            strip_text(item)
+            for item in voice_set_payload.get("voices", [])
+            if strip_text(item) and strip_text(item) != voice_id
+        ]
+        voice_set_payload["voices"] = [*voices, voice_id]
+        voice_set_path.parent.mkdir(parents=True, exist_ok=True)
+        voice_set_path.write_text(
+            json.dumps(voice_set_payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        status = (
+            f"{t('saved_voice_profile')}: {profile_path_text(voice_dir / 'voice.json')}\n"
+            f"Voice set: {profile_path_text(voice_set_path)}"
+        )
+        models, voices_update = refresh_choices(voice_set_id)
+        return status, voice_sets_text(), models, voices_update
+
+    def start_base_assets_download(source: str, force: bool) -> str:
+        args = ["--source", source or DEFAULT_DOWNLOAD_SOURCE]
+        if force:
+            args.append("--force")
+        return download_manager.start(t("pretrained_base_assets"), args)
+
+    def start_v2pro_download(source: str, force: bool) -> str:
+        args = ["--source", source or DEFAULT_DOWNLOAD_SOURCE, "--skip-base-assets", "--v2pro-plus"]
+        if force:
+            args.append("--force")
+        return download_manager.start(t("v2pro_clone_base"), args)
+
+    def start_sample_voice_download(source: str, force: bool) -> str:
+        args = ["--source", source or DEFAULT_DOWNLOAD_SOURCE, "--skip-base-assets", "--sample-reference", "--activate-voices"]
+        if force:
+            args.append("--force")
+        return download_manager.start(t("single_sample_reference"), args)
+
+    def runtime_events_text() -> str:
+        try:
+            return request_text("GET", "/gpt-sovits/logs?limit=160", timeout=3)
+        except Exception as exc:
+            return f"{t('log_endpoint_unavailable')}: {exc}\n\n{RUNTIME_EVENTS.tail(160)}"
+
+    preset_ids = [preset.id for preset in registry.list_model_presets()]
+    initial_models = model_choices()
+    initial_model = initial_models[0] if initial_models else registry.active_voice_set_id()
+    initial_voices = voice_choices(initial_model)
+
+    with gr.Blocks(title=ui_title) as blocks:
+        gr.Markdown(f"# {ui_title}")
+        with gr.Tab(t("home")):
+            status_box = gr.Markdown(value=home_status(), label=t("runtime_status"))
+            process_box = gr.Textbox(value=process_status(), label=t("api_process"), lines=3)
+            with gr.Row():
+                refresh_btn = gr.Button(t("refresh"))
+                load_active_btn = gr.Button(t("load_active"))
+                unload_active_btn = gr.Button(t("unload_model"))
+            if process_manager is not None:
+                with gr.Row():
+                    preload_checkbox = gr.Checkbox(value=False, label=t("preload"))
+                    process_default_voice = gr.Dropdown(
+                        choices=voice_choices(initial_model),
+                        value=registry.default_voice_id(),
+                        label=t("default_voice"),
+                    )
+                    start_api_btn = gr.Button(t("start_api"))
+                    stop_api_btn = gr.Button(t("stop_api"))
+                start_api_btn.click(start_api, inputs=[process_default_voice, preload_checkbox], outputs=[process_box, status_box])
+                stop_api_btn.click(stop_api, outputs=[process_box, status_box])
+            refresh_btn.click(home_refresh, outputs=[status_box, process_box])
+            load_active_btn.click(load_active_and_refresh, outputs=[status_box, process_box])
+            unload_active_btn.click(unload_and_refresh, outputs=[status_box, process_box])
+            home_timer = gr.Timer(value=2.0, active=True)
+            home_timer.tick(home_refresh, outputs=[status_box, process_box])
+
+        with gr.Tab(t("trial")):
+            with gr.Row():
+                model_dropdown = gr.Dropdown(choices=initial_models, value=initial_model, label=t("voice_set_model"))
+                voice_dropdown = gr.Dropdown(
+                    choices=initial_voices,
+                    value=initial_voices[0] if initial_voices else registry.default_voice_id(),
+                    label=t("voice"),
+                )
+                refresh_choices_btn = gr.Button(t("refresh"))
+            default_preview_text = (
+                "Hello, this is a Neiroha GPT-SoVITS voice cloning test."
+                if language == "en"
+                else "你好，这是 Neiroha GPT-SoVITS 的语音复刻测试。"
+            )
+            text_input = gr.Textbox(value=default_preview_text, label=t("text"), lines=3)
+            with gr.Row():
+                format_dropdown = gr.Dropdown(choices=sorted(SUPPORTED_OPENAI_FORMATS), value="wav", label=t("format"))
+                speed_slider = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label=t("speed"))
+                synth_btn = gr.Button(t("generate"))
+            audio_output = gr.Audio(type="filepath", label=t("audio_output"))
+            metrics_box = gr.Code(label=t("metrics"), language="json")
+            model_dropdown.change(refresh_voice_dropdown, inputs=model_dropdown, outputs=voice_dropdown)
+            refresh_choices_btn.click(refresh_choices, inputs=model_dropdown, outputs=[model_dropdown, voice_dropdown])
+            synth_btn.click(
+                synthesize_preview,
+                inputs=[model_dropdown, voice_dropdown, text_input, format_dropdown, speed_slider],
+                outputs=[audio_output, metrics_box],
+            )
+
+        with gr.Tab(t("clone_config")):
+            with gr.Row():
+                clone_voice_set = gr.Dropdown(
+                    choices=[voice_set.id for voice_set in registry.list_voice_sets()],
+                    value=registry.active_voice_set_id(),
+                    label=t("save_to_voice_set"),
+                )
+                clone_model_preset = gr.Dropdown(
+                    choices=preset_ids,
+                    value=registry.active_model_preset_id() if registry.active_model_preset_id() in preset_ids else preset_ids[0],
+                    label=t("use_model_preset"),
+                )
+                clone_voice_id = gr.Textbox(value="local-voice", label=t("voice_id"))
+                clone_voice_name = gr.Textbox(value="Local Voice", label=t("name"))
+            clone_ref_file = gr.Audio(type="filepath", label=t("upload_reference"))
+            clone_ref_path = gr.Textbox(label=t("reference_path"))
+            clone_prompt_text = gr.Textbox(label=t("prompt_text"), lines=2)
+            with gr.Row():
+                clone_prompt_lang = gr.Textbox(value="zh", label=t("prompt_lang"))
+                clone_text_lang = gr.Textbox(value="zh", label=t("text_lang"))
+                clone_speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label=t("default_speed"))
+            with gr.Accordion(t("trained_weight_override"), open=False):
+                clone_gpt_weights = gr.Textbox(
+                    label=t("gpt_ckpt"),
+                    placeholder="models/voices/.../xxx.ckpt",
+                )
+                clone_sovits_weights = gr.Textbox(
+                    label=t("sovits_pth"),
+                    placeholder="models/voices/.../xxx.pth",
+                )
+            save_voice_btn = gr.Button(t("save_voice"))
+            save_voice_status = gr.Textbox(label=t("save_result"))
+            voice_sets_box = gr.Code(value=voice_sets_text, language="json", label=t("voice_sets"))
+            save_voice_btn.click(
+                write_voice_profile,
+                inputs=[
+                    clone_voice_set,
+                    clone_model_preset,
+                    clone_voice_id,
+                    clone_voice_name,
+                    clone_ref_file,
+                    clone_ref_path,
+                    clone_prompt_text,
+                    clone_prompt_lang,
+                    clone_text_lang,
+                    clone_speed,
+                    clone_gpt_weights,
+                    clone_sovits_weights,
+                ],
+                outputs=[save_voice_status, voice_sets_box, model_dropdown, voice_dropdown],
+            )
+
+        with gr.Tab(t("model_presets")):
+            preset_dropdown = gr.Dropdown(
+                choices=preset_ids,
+                value=registry.active_model_preset_id() if registry.active_model_preset_id() in preset_ids else preset_ids[0],
+                label=t("current_preset"),
+            )
+            with gr.Row():
+                load_btn = gr.Button(t("load"))
+                unload_btn = gr.Button(t("unload"))
+                reload_btn = gr.Button(t("reload"))
+            preset_status = gr.Code(value=presets_text, language="json", label=t("preset_status"))
+            load_btn.click(load_preset, inputs=preset_dropdown, outputs=preset_status)
+            unload_btn.click(unload_model, outputs=preset_status)
+            reload_btn.click(reload_preset, inputs=preset_dropdown, outputs=preset_status)
+            with gr.Accordion(t("new_preset"), open=False):
+                with gr.Row():
+                    new_preset_id = gr.Textbox(value="trained-local", label=t("preset_id"))
+                    new_preset_name = gr.Textbox(value="Trained Local", label=t("name"))
+                new_preset_config = gr.Textbox(
+                    value=profile_path_text(DEFAULT_CONFIG_PATH),
+                    label=t("config_path"),
+                )
+                new_preset_gpt = gr.Textbox(label=t("gpt_ckpt"))
+                new_preset_sovits = gr.Textbox(label=t("sovits_pth"))
+                save_preset_btn = gr.Button(t("save_preset"))
+                preset_save_status = gr.Textbox(label=t("save_result"))
+                save_preset_btn.click(
+                    write_model_preset,
+                    inputs=[
+                        new_preset_id,
+                        new_preset_name,
+                        new_preset_config,
+                        new_preset_gpt,
+                        new_preset_sovits,
+                    ],
+                    outputs=[preset_save_status, preset_dropdown, clone_model_preset],
+                )
+
+        with gr.Tab(t("download")):
+            with gr.Row():
+                download_source = gr.Dropdown(
+                    choices=["modelscope", "hf", "hf-mirror"],
+                    value=DEFAULT_DOWNLOAD_SOURCE,
+                    label=t("download_source"),
+                )
+                download_force = gr.Checkbox(value=False, label=t("force_redownload"))
+            with gr.Row():
+                download_base_btn = gr.Button(t("download_base"))
+                download_v2pro_btn = gr.Button(t("download_v2pro"))
+                download_sample_btn = gr.Button(t("download_sample"))
+                download_refresh_btn = gr.Button(t("refresh_log"))
+                download_stop_btn = gr.Button(t("stop_download"))
+            download_status_box = gr.Textbox(value=download_manager.status, label=t("download_status"), lines=18)
+            download_base_btn.click(start_base_assets_download, inputs=[download_source, download_force], outputs=download_status_box)
+            download_v2pro_btn.click(start_v2pro_download, inputs=[download_source, download_force], outputs=download_status_box)
+            download_sample_btn.click(start_sample_voice_download, inputs=[download_source, download_force], outputs=download_status_box)
+            download_refresh_btn.click(download_manager.status, outputs=download_status_box)
+            download_stop_btn.click(download_manager.stop, outputs=download_status_box)
+
+        with gr.Tab(t("logs")):
+            events_box = gr.Textbox(value=runtime_events_text(), label=t("backend_log"), lines=28)
+            events_refresh_btn = gr.Button(t("refresh"))
+            events_refresh_btn.click(runtime_events_text, outputs=events_box)
+            log_timer = gr.Timer(value=2.0, active=True)
+            log_timer.tick(runtime_events_text, outputs=events_box)
+
+    return blocks.queue(max_size=8, default_concurrency_limit=1)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Launch GPT-SoVITS for Neiroha with native and OpenAI-compatible APIs.",
     )
-    parser.add_argument("--mode", choices=["api", "admin", "admin-ui", "webui", "combined"], default="api")
+    parser.add_argument(
+        "--mode",
+        choices=["api", "admin", "api-admin", "api-preload", "api-admin-preload", "admin-ui", "webui", "combined"],
+        default="api",
+    )
     parser.add_argument("--repo-dir", type=Path, default=DEFAULT_REPO_DIR)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--profiles", type=Path, default=DEFAULT_PROFILE_PATH)
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--device", default="config", help="config, auto, cpu, cuda, or cuda:N")
     parser.add_argument("--half", action="store_true", help="Force half precision.")
     parser.add_argument("--no-half", action="store_true", help="Force full precision.")
     parser.add_argument("--preload-model", action="store_true")
     parser.add_argument("--default-voice", default=os.environ.get("NEIROHA_GPT_SOVITS_DEFAULT_VOICE", ""))
-    parser.add_argument("--api-base", default="http://127.0.0.1:9880")
-    parser.add_argument("--api-host", default="0.0.0.0")
+    parser.add_argument("--api-base", default=None)
+    parser.add_argument("--api-host", default=None)
     parser.add_argument("--api-port", type=int, default=None)
     parser.add_argument("--auto-start-api", action="store_true")
     parser.add_argument("--gradio-path", default="/admin")
@@ -3268,10 +4427,16 @@ def configure_logging() -> None:
     )
 
 
-def resolve_port(mode: str, port: Optional[int]) -> int:
-    if port is not None:
-        return port
-    return 7860 if mode in {"admin", "admin-ui", "webui"} else 9880
+def mode_settings(mode: str, preload_model: bool) -> tuple[str, bool]:
+    if mode == "admin-ui":
+        return "admin", preload_model
+    if mode == "webui":
+        return "api-admin", preload_model
+    if mode == "api-preload":
+        return "api", True
+    if mode == "api-admin-preload":
+        return "api-admin", True
+    return mode, preload_model
 
 
 def resolve_api_port(api_base: str, explicit_port: Optional[int]) -> int:
@@ -3281,6 +4446,68 @@ def resolve_api_port(api_base: str, explicit_port: Optional[int]) -> int:
     if parsed.port is not None:
         return parsed.port
     return 9880
+
+
+def socket_bind_host(host: str) -> str:
+    host = strip_text(host)
+    if not host:
+        return "127.0.0.1"
+    return host
+
+
+def browser_host(host: str) -> str:
+    host = socket_bind_host(host)
+    if host in {"0.0.0.0", "::"}:
+        return "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
+def http_url(host: str, port: int) -> str:
+    return f"http://{browser_host(host)}:{int(port)}"
+
+
+def _socket_family(host: str) -> socket.AddressFamily:
+    return socket.AF_INET6 if ":" in socket_bind_host(host) else socket.AF_INET
+
+
+def can_bind_port(host: str, port: int) -> tuple[bool, str]:
+    try:
+        with socket.socket(_socket_family(host), socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((socket_bind_host(host), int(port)))
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+
+
+def random_bindable_port(host: str) -> int:
+    with socket.socket(_socket_family(host), socket.SOCK_STREAM) as sock:
+        sock.bind((socket_bind_host(host), 0))
+        return int(sock.getsockname()[1])
+
+
+def resolve_bind_port(host: str, requested_port: int, label: str) -> int:
+    requested_port = int(requested_port)
+    ok, reason = can_bind_port(host, requested_port)
+    if ok:
+        return requested_port
+    selected_port = random_bindable_port(host)
+    message = (
+        f"{label} configured port {requested_port} is unavailable on {socket_bind_host(host)}; "
+        f"using random port {selected_port}. Reason: {reason}"
+    )
+    LOGGER.warning(message)
+    RUNTIME_EVENTS.append(
+        "port_fallback",
+        service=label,
+        host=socket_bind_host(host),
+        requested_port=requested_port,
+        selected_port=selected_port,
+        reason=reason,
+    )
+    return selected_port
 
 
 def local_api_base(api_base: str, api_port: int) -> str:
@@ -3295,7 +4522,6 @@ def local_api_base(api_base: str, api_port: int) -> str:
 def main() -> None:
     configure_logging()
     args = parse_args()
-    port = resolve_port(args.mode, args.port)
     is_half = True if args.half else False if args.no_half else None
     terminal_rtf_log = bool(args.rtf_log and not args.no_rtf_log)
 
@@ -3307,67 +4533,128 @@ def main() -> None:
         debug_runtime_output=args.debug_runtime_output,
     )
     registry = VoiceRegistry(args.profiles, repo_dir=args.repo_dir.resolve())
+    server_config = registry.server_config()
+    api_config = server_config.get("api", {}) if isinstance(server_config.get("api"), dict) else {}
+    admin_config = server_config.get("admin", {}) if isinstance(server_config.get("admin"), dict) else {}
+    effective_mode, preload_model = mode_settings(args.mode, args.preload_model)
 
-    if args.preload_model and args.mode != "admin-ui":
+    api_host = (
+        args.api_host
+        or (args.host if effective_mode in {"api", "combined"} else None)
+        or api_config.get("host")
+        or "127.0.0.1"
+    )
+    requested_api_port = (
+        args.api_port
+        or (args.port if effective_mode in {"api", "combined"} else None)
+        or int(api_config.get("port") or 9880)
+    )
+    admin_host = (
+        (args.host if effective_mode in {"admin", "api-admin"} else None)
+        or admin_config.get("host")
+        or "127.0.0.1"
+    )
+    requested_admin_port = (
+        (args.port if effective_mode in {"admin", "api-admin"} else None)
+        or int(admin_config.get("port") or 17860)
+    )
+    starts_api = effective_mode in {"api", "api-admin", "combined"}
+    starts_standalone_admin = effective_mode in {"admin", "api-admin"}
+    api_port = (
+        resolve_bind_port(api_host, int(requested_api_port), "FastAPI")
+        if starts_api
+        else int(requested_api_port)
+    )
+    admin_port = (
+        resolve_bind_port(admin_host, int(requested_admin_port), "Gradio Admin")
+        if starts_standalone_admin
+        else int(requested_admin_port)
+    )
+    api_base = args.api_base or http_url(api_host, api_port)
+    admin_url = http_url(admin_host, admin_port) if starts_standalone_admin else ""
+    default_voice = strip_text(args.default_voice) or registry.default_voice_id()
+    if args.config == DEFAULT_CONFIG_PATH:
+        runtime.config_path = Path(registry.get_model_preset(registry.active_model_preset_id()).config_path).resolve()
+
+    if preload_model and effective_mode != "admin":
         runtime.load()
-        default_profile = registry.get(args.default_voice)
+        default_profile = registry.get(default_voice)
         if default_profile is not None:
             runtime.apply_profile_weights(default_profile)
 
     RUNTIME_EVENTS.append(
         "launcher_start",
-        mode=args.mode,
-        host=args.host,
-        port=port,
+        mode=effective_mode,
+        requested_mode=args.mode,
+        api_host=api_host,
+        api_port=api_port,
+        api_url=http_url(api_host, api_port),
+        admin_host=admin_host,
+        admin_port=admin_port,
+        admin_url=admin_url,
         repo_dir=str(args.repo_dir),
-        config_path=str(args.config),
+        config_path=str(runtime.config_path),
         debug_runtime_output=bool(args.debug_runtime_output),
         terminal_rtf_log=terminal_rtf_log,
     )
 
-    if args.mode == "admin-ui":
-        blocks = build_gradio_admin_blocks(args.api_base, registry, process_manager=None)
-        blocks.launch(server_name=args.host, server_port=port, show_error=True)
+    if effective_mode == "admin":
+        LOGGER.info("Gradio Admin URL: %s", admin_url)
+        LOGGER.info("Admin is connecting to FastAPI API Base: %s", api_base)
+        blocks = build_gradio_admin_blocks(api_base, registry, process_manager=None)
+        blocks.launch(server_name=admin_host, server_port=admin_port, show_error=True)
         return
 
-    app = create_api_app(runtime, registry, default_voice_id=args.default_voice, rtf_log=terminal_rtf_log)
+    app = create_api_app(
+        runtime,
+        registry,
+        default_voice_id=default_voice,
+        rtf_log=terminal_rtf_log,
+        admin_url=admin_url,
+    )
 
-    if args.mode in {"admin", "webui"}:
-        admin_port = port
-        api_port = resolve_api_port(args.api_base, args.api_port)
-        ui_api_base = local_api_base(args.api_base, api_port)
+    if effective_mode == "api-admin":
+        ui_api_base = local_api_base(api_base, api_port)
         admin_process = ManagedGradioProcess(
-            host=args.host,
+            host=admin_host,
             port=admin_port,
             api_base=ui_api_base,
             repo_dir=args.repo_dir,
-            config_path=args.config,
+            config_path=runtime.config_path,
             profiles_path=args.profiles,
             log_level=args.log_level,
             debug_runtime_output=args.debug_runtime_output,
         )
         RUNTIME_EVENTS.append(
             "admin_child_start",
-            api_host=args.api_host,
+            api_host=api_host,
             api_port=api_port,
-            admin_host=args.host,
+            api_url=http_url(api_host, api_port),
+            admin_host=admin_host,
             admin_port=admin_port,
+            admin_url=admin_url,
         )
-        admin_process.start()
+        admin_message = admin_process.start()
+        LOGGER.info(admin_message)
+        LOGGER.info("FastAPI URL: %s", http_url(api_host, api_port))
+        LOGGER.info("Gradio Admin URL: %s", admin_url)
         try:
-            uvicorn.run(app, host=args.api_host, port=api_port, log_level=args.log_level)
+            uvicorn.run(app, host=api_host, port=api_port, log_level=args.log_level)
         finally:
             RUNTIME_EVENTS.append("admin_child_stop", message=admin_process.stop())
         return
 
-    if args.mode == "combined":
+    if effective_mode == "combined":
         import gradio as gr
 
         mount_path = args.gradio_path if args.gradio_path.startswith("/") else f"/{args.gradio_path}"
         blocks = build_gradio_blocks(runtime, registry)
         app = gr.mount_gradio_app(app, blocks, path=mount_path, show_error=True)
 
-    uvicorn.run(app, host=args.host, port=port, log_level=args.log_level)
+    LOGGER.info("FastAPI URL: %s", http_url(api_host, api_port))
+    if admin_url:
+        LOGGER.info("Gradio Admin URL: %s", admin_url)
+    uvicorn.run(app, host=api_host, port=api_port, log_level=args.log_level)
 
 
 if __name__ == "__main__":

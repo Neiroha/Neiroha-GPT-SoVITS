@@ -17,15 +17,9 @@ repository itself has an open-source license field.
 - License/risk: Hugging Face shows MIT, but the model card says the uploader is
   sharing another author's files and asks rights holders to contact them for
   removal. Treat as local testing only.
-- Neiroha fit: best current target. `scripts/download_gpt_sovits_assets.py`
-  already supports downloading selected Genshin speakers and writing
-  `profiles/voices.json`.
-
-Default speakers used by this repo:
-
-```text
-派蒙,刻晴,可莉
-```
+- Neiroha fit: best current target for manually adding trained weights. Download
+  the desired character folder yourself, then register its `.ckpt`, `.pth`, and
+  reference `.wav` in the Admin.
 
 ## Secondary Candidates
 
@@ -35,14 +29,9 @@ Default speakers used by this repo:
 - Shape: shared language/work weights with many listed game characters.
 - Assets: model card says `GPT*` files are GPT weights and `SV*` files are
   SoVITS weights.
-- Local downloader presets: `genshin-en`, `genshin-ja`, `wuthering-cn`.
 - Compatibility: v2.
 - Caveat: the model card says it does not provide reference audio, so profiles
   need separate `ref_audio_path` and `prompt_text`.
-- Local reference helper: `scripts/download_gpt_sovits_assets.py
-  --shared-reference-demo` can pair the Genshin EN/JA presets with short
-  reference clips from `AquaV/genshin-voices-separated` and write
-  `profiles/voices.shared-genshin.example.json`.
 - License/risk: Hugging Face shows AGPL-3.0 and the model card also forbids
   redistribution and commercial use. Treat as local testing only.
 - Neiroha fit: good for testing a shared-weight multi-role profile layout after

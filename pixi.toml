@@ -35,10 +35,11 @@ torchvision = { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvisi
 submodule-init = { cmd = "git submodule update --init --recursive" }
 install-deps = { cmd = "python scripts/install_gpt_sovits_deps.py" }
 install-assets = { cmd = "python scripts/download_gpt_sovits_assets.py --source modelscope" }
-install-shared-refs = { cmd = "python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --shared-reference-demo --activate-voices" }
-api = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 9880" }
-api-12080 = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 12080" }
-api-preload = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 9880 --preload-model" }
-admin = { cmd = "python scripts/launch_gpt_sovits.py --mode admin --port 17860 --api-base http://127.0.0.1:19880 --api-port 19880" }
-admin-preload = { cmd = "python scripts/launch_gpt_sovits.py --mode admin --port 17860 --api-base http://127.0.0.1:19880 --api-port 19880 --preload-model" }
+install-sample-voice = { cmd = "python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --sample-reference --activate-voices" }
+api = { cmd = "python scripts/launch_gpt_sovits.py --mode api" }
+api-11451 = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 11451" }
+api-preload = { cmd = "python scripts/launch_gpt_sovits.py --mode api-preload" }
+admin = { cmd = "python scripts/launch_gpt_sovits.py --mode admin" }
+api-admin = { cmd = "python scripts/launch_gpt_sovits.py --mode api-admin" }
+api-admin-preload = { cmd = "python scripts/launch_gpt_sovits.py --mode api-admin-preload" }
 launcher-help = { cmd = "python scripts/launch_gpt_sovits.py --help" }

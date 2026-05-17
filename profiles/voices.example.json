@@ -1,16 +1,19 @@
 {
   "voices": [
     {
-      "id": "default",
-      "name": "Default Reference",
-      "description": "Example voice profile. Copy this file to voices.json and point ref_audio_path to a real local audio file.",
-      "ref_audio_path": "D:/path/to/reference.wav",
-      "prompt_text": "Reference audio transcript goes here.",
+      "id": "genshin-keqing",
+      "name": "Keqing Sample",
+      "description": "Legacy compatibility example. New config should use runtime/voices/<id>/voice.json plus configs/voice-sets/default.json.",
+      "model_id": "default",
+      "model_name": "Default",
+      "model_type": "prompt_clone",
+      "ref_audio_path": "runtime/voices/genshin-keqing/reference.wav",
+      "prompt_text": "这「七圣召唤」虽说是游戏，但对局之中也隐隐有策算谋略之理。",
       "prompt_lang": "zh",
       "text_lang": "zh",
       "aux_ref_audio_paths": [],
-      "gpt_weights_path": "",
-      "sovits_weights_path": ""
+      "gpt_weights_path": "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/s1v3.ckpt",
+      "sovits_weights_path": "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
     }
   ]
 }

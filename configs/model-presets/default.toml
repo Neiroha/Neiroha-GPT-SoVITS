@@ -1,0 +1,9 @@
+schema_version = 1
+id = "v2proplus-clone"
+name = "GPT-SoVITS v2ProPlus Clone"
+engine = "gpt-sovits"
+
+[gpt_sovits]
+config_path = "runtime/cache/tts_infer.yaml"
+gpt_weights_path = "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/s1v3.ckpt"
+sovits_weights_path = "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
