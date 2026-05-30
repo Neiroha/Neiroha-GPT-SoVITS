@@ -4,6 +4,9 @@ name = "GPT-SoVITS v2ProPlus Clone"
 engine = "gpt-sovits"
 
 [gpt_sovits]
+version = "v2ProPlus"
 config_path = "runtime/cache/tts_infer.yaml"
 gpt_weights_path = "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/s1v3.ckpt"
 sovits_weights_path = "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/v2Pro/s2Gv2ProPlus.pth"
+bert_base_path = "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large"
+cnhuhbert_base_path = "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/chinese-hubert-base"

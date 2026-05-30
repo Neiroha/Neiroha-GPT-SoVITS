@@ -6,12 +6,22 @@ import shutil
 import sys
 import tarfile
 import time
-import tomllib
 import urllib.request
 import wave
 import zipfile
 from pathlib import Path
 from typing import Any
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        try:
+            from scripts import toml_compat as tomllib
+        except ModuleNotFoundError:
+            import toml_compat as tomllib
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 REPO_DIR = WORKSPACE_ROOT / "GPT-SoVITS"

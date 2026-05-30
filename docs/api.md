@@ -1,10 +1,11 @@
 # API Reference
 
 FastAPI is the real runtime API. Its default host/port comes from
-`configs/server.toml` and is currently `http://127.0.0.1:19880`.
+`configs/server.toml` and is currently `http://127.0.0.1:9880`.
 The Gradio admin panel is a separate management UI, currently
-`http://127.0.0.1:17860`. The normal `api-admin` task starts FastAPI as the
-primary process and launches the admin UI as a child process.
+`http://127.0.0.1:7860`. Set `[startup].surface = "both"` in
+`configs/server.toml` and run `pixi run serve` to start FastAPI as the primary
+process and launch the admin UI as a child process.
 
 ## Health
 
@@ -24,7 +25,7 @@ POST /v1/audio/speech
 
 `/v1/audio/speech` stays as the OpenAI-compatible speech surface. It uses saved
 trained voice profiles only; clone mode is exposed through native
-`/gpt-sovits/*` routes so Neiroha can model it as a separate capability.
+`/api/gpt-sovits/*` routes so Neiroha can model it as a separate capability.
 
 `GET /v1/audio/voices` returns OpenAI-style voice objects and includes local
 extension fields (`model_id`, `model_name`, `model_type`, `text_lang`,
@@ -71,23 +72,25 @@ Non-streaming synthesis also returns performance headers:
 ## Native GPT-SoVITS
 
 ```http
-GET  /tts
-POST /tts
-GET  /set_refer_audio
-GET  /set_gpt_weights
-GET  /set_sovits_weights
+GET  /api/gpt-sovits/tts
+POST /api/gpt-sovits/tts
+GET  /api/gpt-sovits/set_refer_audio
+GET  /api/gpt-sovits/set_gpt_weights
+GET  /api/gpt-sovits/set_sovits_weights
 GET  /control
-GET  /gpt-sovits/models
-GET  /gpt-sovits/voices
-GET  /gpt-sovits/capabilities
-GET  /gpt-sovits/events
-POST /gpt-sovits/clone
-POST /gpt-sovits/clone/upload
+GET  /api/gpt-sovits/models
+GET  /api/gpt-sovits/voices
+GET  /api/gpt-sovits/capabilities
+GET  /api/gpt-sovits/events
+POST /api/gpt-sovits/clone
+POST /api/gpt-sovits/clone/upload
 ```
 
-`POST /tts` follows the official `api_v2.py` shape and returns audio bytes.
+`POST /api/gpt-sovits/tts` follows the official `api_v2.py` shape and returns
+audio bytes. Legacy `/tts` and `/gpt-sovits/*` routes remain available for
+compatibility.
 
-`/gpt-sovits/models` returns low-level model presets. OpenAI `model` values are
+`/api/gpt-sovits/models` returns low-level model presets. OpenAI `model` values are
 voice sets, not these low-level presets. Clone voices require reference audio
 plus matching `prompt_text`.
 
@@ -122,7 +125,8 @@ SV     models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/sv/pretrained_e
 
 GPT-SoVITS v2ProPlus upstream requires clone reference audio to be in the
 3-10 second range. This launcher does not patch the upstream submodule. Instead,
-for `POST /gpt-sovits/clone` and `POST /gpt-sovits/clone/upload` only, it
+for `POST /api/gpt-sovits/clone` and
+`POST /api/gpt-sovits/clone/upload` only, it
 normalizes the reference audio into a temporary file before inference:
 
 - shorter than `3.05s`: pad trailing silence
@@ -133,7 +137,7 @@ The original upload or source file is not modified, and temporary files are
 removed after synthesis. For long reference audio, write `prompt_text` for the
 first `9.95s`, because that is the effective prompt audio after trimming.
 
-`GET /gpt-sovits/capabilities` exposes this behavior through
+`GET /api/gpt-sovits/capabilities` exposes this behavior through
 `clone_reference_audio.auto_normalize_without_upstream_patch`.
 
 RTF metrics are always returned as response headers and written to the light
@@ -149,7 +153,7 @@ Each top-level launcher start rotates the previous file to
 Read recent summaries, newest first, with:
 
 ```http
-GET /gpt-sovits/logs?limit=80
+GET /api/gpt-sovits/logs?limit=80
 ```
 
 The Gradio admin page has a `日志` tab that refreshes the same log automatically.
@@ -161,16 +165,16 @@ raw output into `runtime/logs/api-debug.log`.
 ## Management
 
 ```http
-GET  /gpt-sovits/meta
-POST /gpt-sovits/load
-POST /gpt-sovits/unload
-POST /gpt-sovits/reload
-POST /gpt-sovits/set_gpt_weights
-POST /gpt-sovits/set_sovits_weights
-POST /gpt-sovits/speech/upload
+GET  /api/gpt-sovits/meta
+POST /api/gpt-sovits/load
+POST /api/gpt-sovits/unload
+POST /api/gpt-sovits/reload
+POST /api/gpt-sovits/set_gpt_weights
+POST /api/gpt-sovits/set_sovits_weights
+POST /api/gpt-sovits/speech/upload
 ```
 
-`/gpt-sovits/load` body:
+`/api/gpt-sovits/load` body:
 
 ```json
 {

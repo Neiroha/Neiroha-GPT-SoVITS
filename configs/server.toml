@@ -1,18 +1,27 @@
 [api]
 host = "127.0.0.1"
-port = 19880
-preload_model = false
+port = 9880
+reload = false
 
 [admin]
 enabled = true
 host = "127.0.0.1"
-port = 17860
+port = 7860
+share = false
 
 [ui]
 title = "Neiroha GPT-SoVITS Admin"
 default_language = "zh"
 
+[startup]
+surface = "both"
+preload_model = true
+default_model_preset = "v2proplus-clone"
+
 [runtime]
 active_model_preset = "v2proplus-clone"
 active_voice_set = "default"
 default_voice = "genshin-keqing"
+
+[security]
+api_key = ""

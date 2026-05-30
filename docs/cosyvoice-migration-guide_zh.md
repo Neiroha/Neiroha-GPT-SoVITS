@@ -59,7 +59,7 @@ api-admin-preload   启动 FastAPI + Gradio Admin + 预加载模型
 ```text
 launcher
   -> uvicorn FastAPI :9880
-  -> gradio Admin :17860
+  -> gradio Admin :7860
 ```
 
 不要做成：
@@ -115,7 +115,7 @@ preload_model = false
 [admin]
 enabled = true
 host = "127.0.0.1"
-port = 17860
+port = 7860
 
 [ui]
 title = "Neiroha CosyVoice Admin"

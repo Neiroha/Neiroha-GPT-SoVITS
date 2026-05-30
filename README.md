@@ -49,13 +49,12 @@ GPT-SoVITS runtime preset.
 
 ```powershell
 pixi install
-pixi run submodule-init
-pixi run install-deps
-pixi run install-assets
+pixi run install
 pixi run install-sample-voice
 ```
 
-`install-assets` downloads the official pretrained assets. `install-sample-voice`
+`install` initializes the submodule, installs upstream GPT-SoVITS Python
+dependencies, and downloads the official pretrained assets. `install-sample-voice`
 downloads only one default sample reference voice; it does not download trained
 multi-character packs.
 
@@ -68,28 +67,29 @@ start_api_admin.bat
 Or use Pixi tasks:
 
 ```powershell
+pixi run serve
 pixi run api
-pixi run api-preload
 pixi run admin
-pixi run api-admin
-pixi run api-admin-preload
+pixi run test
+pixi run smoke
 ```
 
 Default ports come from `configs/server.toml`:
 
 ```text
-FastAPI  http://127.0.0.1:19880
-Admin    http://127.0.0.1:17860
+FastAPI  http://127.0.0.1:9880
+Admin    http://127.0.0.1:7860
 ```
 
-Pixi tasks no longer hard-code these ports by default. If a configured port is
-busy or Windows refuses the bind, the launcher picks an available random port
-and prints the actual FastAPI and Gradio Admin URLs in the terminal and
-`runtime/logs/backend.log`. `api-12080` remains an explicit debug override.
+`serve` reads `configs/server.toml` and uses `[startup].surface` plus
+`[startup].preload_model`. Pixi tasks no longer hard-code host, port, surface
+combinations, or preload policy. If a configured port is busy or Windows refuses
+the bind, the launcher picks an available random port and prints the actual
+FastAPI and Gradio Admin URLs in the terminal and `runtime/logs/backend.log`.
 
 `admin` starts only the Gradio Admin and connects to an existing FastAPI server.
-`api-admin` starts FastAPI and then launches Gradio Admin as a separate child
-process. Gradio is not mounted into FastAPI.
+Set `[startup].surface = "both"` and run `pixi run serve` to start FastAPI and
+Gradio Admin together. Gradio is not mounted into FastAPI.
 
 ## Admin Language
 
@@ -128,19 +128,19 @@ runtime/logs/admin-download.err.log
 List voice sets:
 
 ```powershell
-curl.exe http://127.0.0.1:19880/v1/models
+curl.exe http://127.0.0.1:9880/v1/models
 ```
 
 List voices:
 
 ```powershell
-curl.exe http://127.0.0.1:19880/v1/audio/voices
+curl.exe http://127.0.0.1:9880/v1/audio/voices
 ```
 
 Synthesize speech:
 
 ```powershell
-curl.exe http://127.0.0.1:19880/v1/audio/speech `
+curl.exe http://127.0.0.1:9880/v1/audio/speech `
   -H "Content-Type: application/json" `
   -d '{ "model":"default", "voice":"genshin-keqing", "input":"Hello, this is a voice cloning test.", "response_format":"wav" }' `
   --output speech.wav

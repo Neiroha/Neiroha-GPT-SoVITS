@@ -18,7 +18,6 @@ import sys
 import tempfile
 import threading
 import time
-import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,10 +29,21 @@ from typing import Any, Generator, Iterable, Optional, Union
 import numpy as np
 import soundfile as sf
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        try:
+            from scripts import toml_compat as tomllib
+        except ModuleNotFoundError:
+            import toml_compat as tomllib
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPO_DIR = WORKSPACE_ROOT / "GPT-SoVITS"
@@ -46,6 +56,8 @@ VOICE_SETS_DIR = CONFIG_ROOT / "voice-sets"
 DEFAULT_PROFILE_PATH = WORKSPACE_ROOT / "profiles" / "voices.json"
 MODELS_ROOT = WORKSPACE_ROOT / "models"
 PRETRAINED_MODELS_DIR = MODELS_ROOT / "pretrained" / "GPT-SoVITS" / "GPT_SoVITS" / "pretrained_models"
+DEFAULT_BERT_BASE_PATH = PRETRAINED_MODELS_DIR / "chinese-roberta-wwm-ext-large"
+DEFAULT_CNHUBERT_BASE_PATH = PRETRAINED_MODELS_DIR / "chinese-hubert-base"
 DEFAULT_CLONE_GPT_WEIGHTS = PRETRAINED_MODELS_DIR / "s1v3.ckpt"
 DEFAULT_CLONE_SOVITS_WEIGHTS = PRETRAINED_MODELS_DIR / "v2Pro" / "s2Gv2ProPlus.pth"
 DEFAULT_MODEL_PRESET_ID = "v2proplus-clone"
@@ -93,8 +105,12 @@ os.environ.setdefault("TEMP", str(TEMP_ROOT))
 os.environ.setdefault("TMP", str(TEMP_ROOT))
 os.environ.setdefault("GRADIO_TEMP_DIR", str(TEMP_ROOT / "gradio"))
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("bert_path", str(DEFAULT_BERT_BASE_PATH))
+os.environ.setdefault("cnhubert_base_path", str(DEFAULT_CNHUBERT_BASE_PATH))
 
 LOGGER = logging.getLogger("neiroha.gpt_sovits")
+BACKEND_SLUG = "gpt-sovits"
+NATIVE_API_PREFIX = "/api/gpt-sovits"
 OPENAI_MODEL_ALIAS = DEFAULT_VOICE_SET_ID
 LEGACY_OPENAI_MODEL_ALIASES = {"gpt-sovits", "tts-1", "tts-1-hd"}
 SUPPORTED_OPENAI_FORMATS = {"mp3", "opus", "aac", "flac", "wav", "pcm", "ogg", "raw"}
@@ -260,14 +276,39 @@ def json_response(payload: Any, status_code: int = 200) -> JSONResponse:
     return JSONResponse(content=payload, status_code=status_code)
 
 
+def error_code_from_message(message: str, fallback: str = "inference_failed") -> str:
+    text = message.lower()
+    if "voice" in text and ("not found" in text or "unknown" in text):
+        return "voice_not_found"
+    if "model preset" in text or "unknown model" in text or "unknown voice set" in text:
+        return "model_preset_not_found"
+    if "response_format" in text or "media_type" in text or "unsupported" in text:
+        return "unsupported_format"
+    if "ref_audio" in text or "reference audio" in text:
+        return "invalid_reference_audio"
+    if "not loaded" in text:
+        return "model_not_loaded"
+    return fallback
+
+
 def openai_error(
     message: str,
     *,
     status_code: int = 400,
     error_type: str = "invalid_request_error",
+    code: Optional[str] = None,
+    details: Optional[dict[str, Any]] = None,
 ) -> JSONResponse:
+    stable_code = code or error_code_from_message(message, fallback="invalid_request")
     return json_response(
-        {"error": {"message": message, "type": error_type}},
+        {
+            "error": {
+                "code": stable_code,
+                "message": message,
+                "details": details or {},
+                "type": error_type,
+            }
+        },
         status_code=status_code,
     )
 
@@ -479,9 +520,12 @@ class ModelPreset:
     id: str
     name: str
     engine: str = "gpt-sovits"
+    version: str = "v2ProPlus"
     config_path: str = str(DEFAULT_CONFIG_PATH)
     gpt_weights_path: str = str(DEFAULT_CLONE_GPT_WEIGHTS)
     sovits_weights_path: str = str(DEFAULT_CLONE_SOVITS_WEIGHTS)
+    bert_base_path: str = str(DEFAULT_BERT_BASE_PATH)
+    cnhuhbert_base_path: str = str(DEFAULT_CNHUBERT_BASE_PATH)
 
     @classmethod
     def from_toml(cls, payload: dict[str, Any], *, repo_dir: Path) -> "ModelPreset":
@@ -491,12 +535,17 @@ class ModelPreset:
             id=preset_id,
             name=first_non_empty(payload.get("name"), preset_id),
             engine=strip_text(payload.get("engine")) or "gpt-sovits",
+            version=strip_text(gpt_sovits.get("version")) or "v2ProPlus",
             config_path=resolve_optional_path(gpt_sovits.get("config_path"), repo_dir=repo_dir)
             or str(DEFAULT_CONFIG_PATH),
             gpt_weights_path=resolve_optional_path(gpt_sovits.get("gpt_weights_path"), repo_dir=repo_dir)
             or str(DEFAULT_CLONE_GPT_WEIGHTS),
             sovits_weights_path=resolve_optional_path(gpt_sovits.get("sovits_weights_path"), repo_dir=repo_dir)
             or str(DEFAULT_CLONE_SOVITS_WEIGHTS),
+            bert_base_path=resolve_optional_path(gpt_sovits.get("bert_base_path"), repo_dir=repo_dir)
+            or str(DEFAULT_BERT_BASE_PATH),
+            cnhuhbert_base_path=resolve_optional_path(gpt_sovits.get("cnhuhbert_base_path"), repo_dir=repo_dir)
+            or str(DEFAULT_CNHUBERT_BASE_PATH),
         )
 
     def to_native_model(self) -> dict[str, Any]:
@@ -506,11 +555,75 @@ class ModelPreset:
             "type": "clone",
             "name": self.name,
             "engine": self.engine,
+            "version": self.version,
             "config_path": self.config_path,
             "gpt_weights_path": self.gpt_weights_path,
             "sovits_weights_path": self.sovits_weights_path,
+            "bert_base_path": self.bert_base_path,
+            "cnhuhbert_base_path": self.cnhuhbert_base_path,
             "requires_reference_audio": True,
         }
+
+
+def materialize_model_preset_config(preset: ModelPreset, config_path: Path) -> Path:
+    config_path = config_path.resolve()
+    runtime_cache_root = RUNTIME_CACHE_ROOT.resolve()
+    try:
+        managed_runtime_config = config_path.is_relative_to(runtime_cache_root)
+    except AttributeError:
+        managed_runtime_config = str(config_path).lower().startswith(str(runtime_cache_root).lower())
+
+    if not managed_runtime_config:
+        return ensure_default_config(config_path)
+
+    try:
+        import yaml
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("PyYAML is required to materialize GPT-SoVITS runtime config.") from exc
+
+    template_path = config_path if config_path.exists() else CONFIG_TEMPLATE_PATH
+    if not template_path.exists():
+        legacy_template = CONFIG_ROOT / "tts_infer.yaml"
+        template_path = legacy_template if legacy_template.exists() else template_path
+    if not template_path.exists():
+        raise FileNotFoundError(f"Default TTS config template is missing: {CONFIG_TEMPLATE_PATH}")
+
+    with template_path.open("r", encoding="utf-8") as file:
+        config = yaml.safe_load(file) or {}
+    if not isinstance(config, dict):
+        config = {}
+
+    version = strip_text(preset.version) or "v2ProPlus"
+    version_defaults = config.get(version) if isinstance(config.get(version), dict) else {}
+    previous_custom = config.get("custom") if isinstance(config.get("custom"), dict) else {}
+    custom = dict(version_defaults)
+    for key in ("device", "is_half"):
+        if key in previous_custom:
+            custom[key] = previous_custom[key]
+    custom.update(
+        {
+            "version": version,
+            "t2s_weights_path": preset.gpt_weights_path,
+            "vits_weights_path": preset.sovits_weights_path,
+            "bert_base_path": preset.bert_base_path,
+            "cnhuhbert_base_path": preset.cnhuhbert_base_path,
+        }
+    )
+
+    for field_name, value in (
+        ("gpt_weights_path", preset.gpt_weights_path),
+        ("sovits_weights_path", preset.sovits_weights_path),
+        ("bert_base_path", preset.bert_base_path),
+        ("cnhuhbert_base_path", preset.cnhuhbert_base_path),
+    ):
+        if not Path(value).exists():
+            raise FileNotFoundError(f"Model preset '{preset.id}' {field_name} is missing: {value}")
+
+    config["custom"] = custom
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with config_path.open("w", encoding="utf-8") as file:
+        yaml.safe_dump(config, file, sort_keys=False, allow_unicode=True)
+    return config_path
 
 
 @dataclass
@@ -672,7 +785,11 @@ class VoiceRegistry:
 
     def active_state(self) -> dict[str, Any]:
         state: dict[str, Any] = {}
-        runtime_config = self.server_config().get("runtime", {})
+        server_config = self.server_config()
+        startup_config = server_config.get("startup", {})
+        if isinstance(startup_config, dict) and strip_text(startup_config.get("default_model_preset")):
+            state["active_model_preset"] = strip_text(startup_config.get("default_model_preset"))
+        runtime_config = server_config.get("runtime", {})
         if isinstance(runtime_config, dict):
             state.update(runtime_config)
         candidates = [self.active_state_path]
@@ -1420,19 +1537,30 @@ def audio_response(
     *,
     speaker: Any = "",
     metrics: Optional[dict[str, float]] = None,
+    model_preset: str = "",
+    voice: str = "",
 ) -> Response:
     fmt = require_supported_format(response_format)
     content = pack_audio(audio_data, sample_rate, fmt)
     output_path = write_runtime_output(content, speaker or "speech", fmt)
     headers = {
         "Content-Disposition": f'inline; filename="{output_path.name}"',
+        "X-Neiroha-Backend": BACKEND_SLUG,
         "X-Neiroha-Output-Path": header_safe_path(output_path),
+        "X-Neiroha-Sample-Rate": str(sample_rate),
+        "X-Neiroha-Output-Format": fmt,
     }
+    if model_preset:
+        headers["X-Neiroha-Model-Preset"] = strip_text(model_preset)
+    if voice or speaker:
+        headers["X-Neiroha-Voice"] = strip_text(voice) or strip_text(speaker)
     if metrics:
+        inference_ms = float(metrics.get("elapsed_seconds", 0.0)) * 1000.0
         headers.update(
             {
                 "X-Neiroha-Audio-Seconds": f"{metrics.get('audio_seconds', 0.0):.6f}",
                 "X-Neiroha-Elapsed-Seconds": f"{metrics.get('elapsed_seconds', 0.0):.6f}",
+                "X-Neiroha-Inference-Ms": f"{inference_ms:.3f}",
                 "X-Neiroha-RTF": f"{metrics.get('rtf', 0.0):.6f}",
             }
         )
@@ -1461,7 +1589,14 @@ def streaming_audio_response(
             else:
                 yield pack_audio(chunk, sample_rate, fmt)
 
-    return StreamingResponse(generator(), media_type=CONTENT_TYPES[fmt])
+    return StreamingResponse(
+        generator(),
+        media_type=CONTENT_TYPES[fmt],
+        headers={
+            "X-Neiroha-Backend": BACKEND_SLUG,
+            "X-Neiroha-Output-Format": fmt,
+        },
+    )
 
 
 def log_rtf(
@@ -1572,10 +1707,10 @@ def create_api_app(
             "message": "Neiroha GPT-SoVITS launcher is running.",
             "health": "/health",
             "openai_speech": "/v1/audio/speech",
-            "native_clone": "/gpt-sovits/clone",
-            "native_clone_upload": "/gpt-sovits/clone/upload",
-            "capabilities": "/gpt-sovits/capabilities",
-            "native_speech": "/tts",
+            "native_clone": "/api/gpt-sovits/clone",
+            "native_clone_upload": "/api/gpt-sovits/clone/upload",
+            "capabilities": "/api/gpt-sovits/capabilities",
+            "native_speech": "/api/gpt-sovits/tts",
             "admin": admin_url or "/admin",
         }
 
@@ -1584,6 +1719,7 @@ def create_api_app(
     def health():
         return {
             "status": "ok",
+            "backend": BACKEND_SLUG,
             "active_voice_set": registry.active_voice_set_id(),
             "active_model_preset": registry.active_model_preset_id(),
             "default_voice": strip_text(default_voice_id) or registry.default_voice_id(),
@@ -1628,10 +1764,12 @@ def create_api_app(
         ]
         return {"object": "list", "data": voices, "voices": compact}
 
+    @app.get("/api/gpt-sovits/models")
     @app.get("/gpt-sovits/models")
     def list_native_models():
         return {"object": "list", "data": native_model_catalog(registry)}
 
+    @app.get("/api/gpt-sovits/voices")
     @app.get("/gpt-sovits/voices")
     def list_native_voices(model_id: Optional[str] = None):
         profiles = registry.list_profiles()
@@ -1643,6 +1781,7 @@ def create_api_app(
             data.append(profile.to_native_voice(model_id=current_model_id))
         return {"object": "list", "data": data}
 
+    @app.get("/api/gpt-sovits/capabilities")
     @app.get("/gpt-sovits/capabilities")
     def capabilities():
         return {
@@ -1660,10 +1799,10 @@ def create_api_app(
             },
             "routes": {
                 "openai_speech": "/v1/audio/speech",
-                "trained_models": "/gpt-sovits/models",
-                "trained_voices": "/gpt-sovits/voices",
-                "clone_speech": "/gpt-sovits/clone",
-                "clone_upload": "/gpt-sovits/clone/upload",
+                "trained_models": "/api/gpt-sovits/models",
+                "trained_voices": "/api/gpt-sovits/voices",
+                "clone_speech": "/api/gpt-sovits/clone",
+                "clone_upload": "/api/gpt-sovits/clone/upload",
             },
             "clone_reference_audio": {
                 "upstream_required_seconds": [3.0, 10.0],
@@ -1673,7 +1812,7 @@ def create_api_app(
                 "normalized_seconds": [CLONE_REFERENCE_MIN_SECONDS, CLONE_REFERENCE_MAX_SECONDS],
             },
             "logging": {
-                "runtime_log": "/gpt-sovits/logs",
+                "runtime_log": "/api/gpt-sovits/logs",
                 "log_path": str(RUNTIME_EVENT_LOG_PATH),
                 "raw_runtime_output_default": "suppressed",
                 "raw_runtime_output_debug_log": str(RUNTIME_DEBUG_LOG_PATH),
@@ -1688,6 +1827,7 @@ def create_api_app(
             return [{"name": "default", "voice_id": "default"}]
         return [profile.to_speaker() for profile in profiles]
 
+    @app.get("/api/gpt-sovits/meta")
     @app.get("/gpt-sovits/meta")
     def meta():
         return {
@@ -1708,23 +1848,24 @@ def create_api_app(
             "voices": [profile.to_openai_voice() for profile in registry.list_profiles()],
             "native_models": native_model_catalog(registry),
             "routes": {
-                "native_tts": "/tts",
+                "native_tts": "/api/gpt-sovits/tts",
                 "openai_speech": "/v1/audio/speech",
-                "native_models": "/gpt-sovits/models",
-                "native_voices": "/gpt-sovits/voices",
-                "native_clone": "/gpt-sovits/clone",
-                "native_clone_upload": "/gpt-sovits/clone/upload",
-                "capabilities": "/gpt-sovits/capabilities",
+                "native_models": "/api/gpt-sovits/models",
+                "native_voices": "/api/gpt-sovits/voices",
+                "native_clone": "/api/gpt-sovits/clone",
+                "native_clone_upload": "/api/gpt-sovits/clone/upload",
+                "capabilities": "/api/gpt-sovits/capabilities",
                 "models": "/v1/models",
                 "voices": "/v1/audio/voices",
-                "logs": "/gpt-sovits/logs",
-                "load": "/gpt-sovits/load",
-                "unload": "/gpt-sovits/unload",
+                "logs": "/api/gpt-sovits/logs",
+                "load": "/api/gpt-sovits/load",
+                "unload": "/api/gpt-sovits/unload",
                 "set_gpt_weights": "/set_gpt_weights",
                 "set_sovits_weights": "/set_sovits_weights",
             },
         }
 
+    @app.get("/api/gpt-sovits/events")
     @app.get("/gpt-sovits/events")
     def runtime_events(limit: int = Query(80, ge=1, le=500)):
         return {
@@ -1733,6 +1874,7 @@ def create_api_app(
             "data": RUNTIME_EVENTS.tail(limit),
         }
 
+    @app.get("/api/gpt-sovits/logs")
     @app.get("/gpt-sovits/logs")
     def runtime_logs(limit: int = Query(120, ge=1, le=1000)):
         return Response(
@@ -1769,7 +1911,15 @@ def create_api_app(
                 audio_data=audio_data,
                 started_at=started_at,
             )
-            return audio_response(sample_rate, audio_data, request["media_type"], speaker=speaker, metrics=metrics)
+            return audio_response(
+                sample_rate,
+                audio_data,
+                request["media_type"],
+                speaker=speaker,
+                metrics=metrics,
+                model_preset=profile.model_preset if profile else registry.active_model_preset_id(),
+                voice=speaker,
+            )
         except FileNotFoundError as exc:
             return openai_error(str(exc), status_code=404)
         except (ValueError, RuntimeError) as exc:
@@ -1778,6 +1928,7 @@ def create_api_app(
             LOGGER.exception("OpenAI-compatible synthesis failed.")
             return openai_error(str(exc), status_code=500, error_type="server_error")
 
+    @app.post("/api/gpt-sovits/clone")
     @app.post("/gpt-sovits/clone")
     def clone_audio_speech(payload: CloneSpeechRequest):
         if payload.model and payload.model not in {OPENAI_MODEL_ALIAS, *LEGACY_OPENAI_MODEL_ALIASES}:
@@ -1810,6 +1961,8 @@ def create_api_app(
                 request["media_type"],
                 speaker=payload.speaker or "clone",
                 metrics=metrics,
+                model_preset=profile.model_preset if profile else registry.active_model_preset_id(),
+                voice=payload.speaker or "clone",
             )
         except FileNotFoundError as exc:
             return openai_error(str(exc), status_code=404)
@@ -1821,6 +1974,7 @@ def create_api_app(
         finally:
             cleanup_temp_files([normalized_ref])
 
+    @app.get("/api/gpt-sovits/tts")
     @app.get("/tts")
     def tts_get(
         text: Optional[str] = None,
@@ -1876,6 +2030,7 @@ def create_api_app(
         )
         return native_tts_response(request)
 
+    @app.post("/api/gpt-sovits/tts")
     @app.post("/tts")
     def tts_post(payload: TTSRequest):
         return native_tts_response(model_dump(payload))
@@ -1899,15 +2054,24 @@ def create_api_app(
                 audio_data=audio_data,
                 started_at=started_at,
             )
-            return audio_response(sample_rate, audio_data, request["media_type"], speaker="native", metrics=metrics)
+            return audio_response(
+                sample_rate,
+                audio_data,
+                request["media_type"],
+                speaker="native",
+                metrics=metrics,
+                model_preset=registry.active_model_preset_id(),
+                voice="native",
+            )
         except FileNotFoundError as exc:
-            return json_response({"message": str(exc)}, status_code=404)
+            return openai_error(str(exc), status_code=404, code="invalid_reference_audio")
         except (ValueError, RuntimeError) as exc:
-            return json_response({"message": str(exc)}, status_code=400)
+            return openai_error(str(exc), status_code=400)
         except Exception as exc:
             LOGGER.exception("Native synthesis failed.")
-            return json_response({"message": "tts failed", "Exception": str(exc)}, status_code=500)
+            return openai_error(str(exc), status_code=500, error_type="server_error", code="inference_failed")
 
+    @app.post("/api/gpt-sovits/speech/upload")
     @app.post("/gpt-sovits/speech/upload")
     def speech_upload(
         text: str = Form(...),
@@ -1944,10 +2108,19 @@ def create_api_app(
                 audio_data=audio_data,
                 started_at=started_at,
             )
-            return audio_response(sample_rate, audio_data, response_format, speaker="upload", metrics=metrics)
+            return audio_response(
+                sample_rate,
+                audio_data,
+                response_format,
+                speaker="upload",
+                metrics=metrics,
+                model_preset=registry.active_model_preset_id(),
+                voice="upload",
+            )
         finally:
             cleanup_temp_files([temp_ref])
 
+    @app.post("/api/gpt-sovits/clone/upload")
     @app.post("/gpt-sovits/clone/upload")
     def clone_upload(
         text: str = Form(...),
@@ -1994,7 +2167,15 @@ def create_api_app(
                 audio_data=audio_data,
                 started_at=started_at,
             )
-            return audio_response(sample_rate, audio_data, request["media_type"], speaker=payload.speaker, metrics=metrics)
+            return audio_response(
+                sample_rate,
+                audio_data,
+                request["media_type"],
+                speaker=payload.speaker,
+                metrics=metrics,
+                model_preset=profile.model_preset if profile else registry.active_model_preset_id(),
+                voice=payload.speaker,
+            )
         except FileNotFoundError as exc:
             return openai_error(str(exc), status_code=404)
         except (ValueError, RuntimeError, OSError) as exc:
@@ -2005,6 +2186,7 @@ def create_api_app(
         finally:
             cleanup_temp_files([temp_ref, normalized_ref])
 
+    @app.post("/api/gpt-sovits/load")
     @app.post("/gpt-sovits/load")
     def load_model(payload: LoadRequest):
         try:
@@ -2015,52 +2197,60 @@ def create_api_app(
                 status = runtime.set_sovits_weights(payload.sovits_weights_path)
             return status
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return openai_error(str(exc), status_code=400)
 
+    @app.post("/api/gpt-sovits/unload")
     @app.post("/gpt-sovits/unload")
     def unload_model():
         return runtime.unload()
 
+    @app.post("/api/gpt-sovits/reload")
     @app.post("/gpt-sovits/reload")
     def reload_model(payload: LoadRequest):
         try:
             return runtime.reload(payload.config_path)
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return openai_error(str(exc), status_code=400)
 
+    @app.get("/api/gpt-sovits/set_refer_audio")
     @app.get("/set_refer_audio")
     def set_refer_audio(refer_audio_path: str):
         try:
             return runtime.set_refer_audio(refer_audio_path)
         except Exception as exc:
-            return json_response({"message": "set refer audio failed", "Exception": str(exc)}, status_code=400)
+            return openai_error(str(exc), status_code=400, code="invalid_reference_audio")
 
+    @app.post("/api/gpt-sovits/set_refer_audio")
     @app.post("/set_refer_audio")
     def set_refer_audio_post(payload: ReferAudioRequest):
         return set_refer_audio(payload.refer_audio_path)
 
+    @app.get("/api/gpt-sovits/set_gpt_weights")
     @app.get("/set_gpt_weights")
     def set_gpt_weights(weights_path: str):
         try:
             runtime.set_gpt_weights(weights_path)
             return Response("success", media_type="text/plain")
         except Exception as exc:
-            return json_response({"message": "change gpt weight failed", "Exception": str(exc)}, status_code=400)
+            return openai_error(str(exc), status_code=400, code="model_preset_not_found")
 
     @app.post("/set_gpt_weights")
+    @app.post("/api/gpt-sovits/set_gpt_weights")
     @app.post("/gpt-sovits/set_gpt_weights")
     def set_gpt_weights_post(payload: WeightsRequest):
         return set_gpt_weights(payload.weights_path)
 
+    @app.get("/api/gpt-sovits/set_sovits_weights")
     @app.get("/set_sovits_weights")
     def set_sovits_weights(weights_path: str):
         try:
             runtime.set_sovits_weights(weights_path)
             return Response("success", media_type="text/plain")
         except Exception as exc:
-            return json_response({"message": "change sovits weight failed", "Exception": str(exc)}, status_code=400)
+            return openai_error(str(exc), status_code=400, code="model_preset_not_found")
 
     @app.post("/set_sovits_weights")
+    @app.post("/api/gpt-sovits/set_sovits_weights")
     @app.post("/gpt-sovits/set_sovits_weights")
     def set_sovits_weights_post(payload: WeightsRequest):
         return set_sovits_weights(payload.weights_path)
@@ -2244,16 +2434,24 @@ class ManagedApiProcess:
             return False
 
     def external_admin_ready(self) -> bool:
-        capabilities_url = f"http://127.0.0.1:{self.api_port}/gpt-sovits/capabilities"
-        try:
-            with urllib.request.urlopen(capabilities_url, timeout=2) as response:
-                if response.status != 200:
-                    return False
-                payload = json.loads(response.read().decode("utf-8"))
-        except (OSError, ValueError, urllib.error.URLError):
+        payload: dict[str, Any] = {}
+        for route in (f"{NATIVE_API_PREFIX}/capabilities", "/gpt-sovits/capabilities"):
+            capabilities_url = f"http://127.0.0.1:{self.api_port}{route}"
+            try:
+                with urllib.request.urlopen(capabilities_url, timeout=2) as response:
+                    if response.status != 200:
+                        continue
+                    payload = json.loads(response.read().decode("utf-8"))
+                    break
+            except (OSError, ValueError, urllib.error.URLError):
+                continue
+        if not payload:
             return False
         routes = payload.get("routes", {}) if isinstance(payload, dict) else {}
-        return routes.get("clone_upload") == "/gpt-sovits/clone/upload"
+        return routes.get("clone_upload") in {
+            f"{NATIVE_API_PREFIX}/clone/upload",
+            "/gpt-sovits/clone/upload",
+        }
 
     def command(self, default_voice_id: str, preload_model: bool) -> list[str]:
         command = [
@@ -2298,7 +2496,8 @@ class ManagedApiProcess:
                 return f"FastAPI is already reachable on port {self.api_port}; using the external process."
             return (
                 f"Port {self.api_port} already has a FastAPI process, but it does not expose the current "
-                "admin routes such as /gpt-sovits/clone/upload. Stop that old process or switch ports, then start again."
+                f"admin routes such as {NATIVE_API_PREFIX}/clone/upload. "
+                "Stop that old process or switch ports, then start again."
             )
         selected_voice = strip_text(default_voice_id) or strip_text(self.default_voice_id)
         command = self.command(selected_voice, preload_model)
@@ -2519,12 +2718,13 @@ def build_gradio_admin_blocks_legacy(
             "gpt_weights": "GPT 权重",
             "sovits_weights": "SoVITS 权重",
             "external_process": "API 进程由外层 launcher / start_api_admin.bat 管理；此 Admin 只连接并显示状态。",
-            "home": "首页",
+            "home": "状态",
             "trial": "试音",
-            "clone_config": "克隆配置",
+            "clone_config": "Voice Sets",
             "model_presets": "Model Presets",
             "download": "下载",
-            "logs": "日志",
+            "logs": "运行日志",
+            "settings": "设置",
             "runtime_status": "运行状态",
             "api_process": "API 进程",
             "refresh": "刷新",
@@ -2595,12 +2795,13 @@ def build_gradio_admin_blocks_legacy(
             "gpt_weights": "GPT weights",
             "sovits_weights": "SoVITS weights",
             "external_process": "The API process is managed by the outer launcher / start_api_admin.bat; this Admin only connects to it.",
-            "home": "Home",
-            "trial": "Test Voice",
-            "clone_config": "Voice Config",
+            "home": "Status",
+            "trial": "Synthesis Test",
+            "clone_config": "Voice Sets",
             "model_presets": "Model Presets",
             "download": "Downloads",
-            "logs": "Logs",
+            "logs": "Runtime Logs",
+            "settings": "Settings",
             "runtime_status": "Runtime Status",
             "api_process": "API Process",
             "refresh": "Refresh",
@@ -3784,12 +3985,13 @@ def build_gradio_admin_blocks(
             "gpt_weights": "GPT 权重",
             "sovits_weights": "SoVITS 权重",
             "external_process": "API 进程由外层 launcher / start_api_admin.bat 管理；此 Admin 只连接并显示状态。",
-            "home": "首页",
+            "home": "状态",
             "trial": "试音",
-            "clone_config": "克隆配置",
+            "clone_config": "Voice Sets",
             "model_presets": "Model Presets",
             "download": "下载",
-            "logs": "日志",
+            "logs": "运行日志",
+            "settings": "设置",
             "runtime_status": "运行状态",
             "api_process": "API 进程",
             "refresh": "刷新",
@@ -3870,12 +4072,13 @@ def build_gradio_admin_blocks(
             "gpt_weights": "GPT weights",
             "sovits_weights": "SoVITS weights",
             "external_process": "The API process is managed by the outer launcher / start_api_admin.bat; this Admin only connects to it.",
-            "home": "Home",
-            "trial": "Test Voice",
-            "clone_config": "Voice Config",
+            "home": "Status",
+            "trial": "Synthesis Test",
+            "clone_config": "Voice Sets",
             "model_presets": "Model Presets",
             "download": "Downloads",
-            "logs": "Logs",
+            "logs": "Runtime Logs",
+            "settings": "Settings",
             "runtime_status": "Runtime Status",
             "api_process": "API Process",
             "refresh": "Refresh",
@@ -4295,6 +4498,52 @@ def build_gradio_admin_blocks(
     initial_model = initial_models[0] if initial_models else registry.active_voice_set_id()
     initial_voices = voice_choices(initial_model)
 
+    def write_model_preset_for_tab(
+        preset_id: str,
+        preset_name: str,
+        config_path: str,
+        gpt_weights_path: str,
+        sovits_weights_path: str,
+    ) -> tuple[str, Any]:
+        status, preset_update, _clone_update = write_model_preset(
+            preset_id,
+            preset_name,
+            config_path,
+            gpt_weights_path,
+            sovits_weights_path,
+        )
+        return status, preset_update
+
+    def write_voice_profile_for_tab(
+        voice_set_id: str,
+        model_preset_id: str,
+        voice_id: str,
+        voice_name: str,
+        ref_audio_file: Optional[str],
+        ref_audio_path: str,
+        prompt_text: str,
+        prompt_lang: str,
+        text_lang: str,
+        speed: float,
+        gpt_weights_path: str,
+        sovits_weights_path: str,
+    ) -> tuple[str, str]:
+        status, voice_sets, _models, _voices = write_voice_profile(
+            voice_set_id,
+            model_preset_id,
+            voice_id,
+            voice_name,
+            ref_audio_file,
+            ref_audio_path,
+            prompt_text,
+            prompt_lang,
+            text_lang,
+            speed,
+            gpt_weights_path,
+            sovits_weights_path,
+        )
+        return status, voice_sets
+
     with gr.Blocks(title=ui_title) as blocks:
         gr.Markdown(f"# {ui_title}")
         with gr.Tab(t("home")):
@@ -4322,34 +4571,43 @@ def build_gradio_admin_blocks(
             home_timer = gr.Timer(value=2.0, active=True)
             home_timer.tick(home_refresh, outputs=[status_box, process_box])
 
-        with gr.Tab(t("trial")):
+        with gr.Tab(t("model_presets")):
+            preset_dropdown = gr.Dropdown(
+                choices=preset_ids,
+                value=registry.active_model_preset_id() if registry.active_model_preset_id() in preset_ids else preset_ids[0],
+                label=t("current_preset"),
+            )
             with gr.Row():
-                model_dropdown = gr.Dropdown(choices=initial_models, value=initial_model, label=t("voice_set_model"))
-                voice_dropdown = gr.Dropdown(
-                    choices=initial_voices,
-                    value=initial_voices[0] if initial_voices else registry.default_voice_id(),
-                    label=t("voice"),
+                load_btn = gr.Button(t("load"))
+                unload_btn = gr.Button(t("unload"))
+                reload_btn = gr.Button(t("reload"))
+            preset_status = gr.Code(value=presets_text, language="json", label=t("preset_status"))
+            load_btn.click(load_preset, inputs=preset_dropdown, outputs=preset_status)
+            unload_btn.click(unload_model, outputs=preset_status)
+            reload_btn.click(reload_preset, inputs=preset_dropdown, outputs=preset_status)
+            with gr.Accordion(t("new_preset"), open=False):
+                with gr.Row():
+                    new_preset_id = gr.Textbox(value="trained-local", label=t("preset_id"))
+                    new_preset_name = gr.Textbox(value="Trained Local", label=t("name"))
+                new_preset_config = gr.Textbox(
+                    value=profile_path_text(DEFAULT_CONFIG_PATH),
+                    label=t("config_path"),
                 )
-                refresh_choices_btn = gr.Button(t("refresh"))
-            default_preview_text = (
-                "Hello, this is a Neiroha GPT-SoVITS voice cloning test."
-                if language == "en"
-                else "你好，这是 Neiroha GPT-SoVITS 的语音复刻测试。"
-            )
-            text_input = gr.Textbox(value=default_preview_text, label=t("text"), lines=3)
-            with gr.Row():
-                format_dropdown = gr.Dropdown(choices=sorted(SUPPORTED_OPENAI_FORMATS), value="wav", label=t("format"))
-                speed_slider = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label=t("speed"))
-                synth_btn = gr.Button(t("generate"))
-            audio_output = gr.Audio(type="filepath", label=t("audio_output"))
-            metrics_box = gr.Code(label=t("metrics"), language="json")
-            model_dropdown.change(refresh_voice_dropdown, inputs=model_dropdown, outputs=voice_dropdown)
-            refresh_choices_btn.click(refresh_choices, inputs=model_dropdown, outputs=[model_dropdown, voice_dropdown])
-            synth_btn.click(
-                synthesize_preview,
-                inputs=[model_dropdown, voice_dropdown, text_input, format_dropdown, speed_slider],
-                outputs=[audio_output, metrics_box],
-            )
+                new_preset_gpt = gr.Textbox(label=t("gpt_ckpt"))
+                new_preset_sovits = gr.Textbox(label=t("sovits_pth"))
+                save_preset_btn = gr.Button(t("save_preset"))
+                preset_save_status = gr.Textbox(label=t("save_result"))
+                save_preset_btn.click(
+                    write_model_preset_for_tab,
+                    inputs=[
+                        new_preset_id,
+                        new_preset_name,
+                        new_preset_config,
+                        new_preset_gpt,
+                        new_preset_sovits,
+                    ],
+                    outputs=[preset_save_status, preset_dropdown],
+                )
 
         with gr.Tab(t("clone_config")):
             with gr.Row():
@@ -4385,7 +4643,7 @@ def build_gradio_admin_blocks(
             save_voice_status = gr.Textbox(label=t("save_result"))
             voice_sets_box = gr.Code(value=voice_sets_text, language="json", label=t("voice_sets"))
             save_voice_btn.click(
-                write_voice_profile,
+                write_voice_profile_for_tab,
                 inputs=[
                     clone_voice_set,
                     clone_model_preset,
@@ -4400,46 +4658,37 @@ def build_gradio_admin_blocks(
                     clone_gpt_weights,
                     clone_sovits_weights,
                 ],
-                outputs=[save_voice_status, voice_sets_box, model_dropdown, voice_dropdown],
+                outputs=[save_voice_status, voice_sets_box],
             )
 
-        with gr.Tab(t("model_presets")):
-            preset_dropdown = gr.Dropdown(
-                choices=preset_ids,
-                value=registry.active_model_preset_id() if registry.active_model_preset_id() in preset_ids else preset_ids[0],
-                label=t("current_preset"),
-            )
+        with gr.Tab(t("trial")):
             with gr.Row():
-                load_btn = gr.Button(t("load"))
-                unload_btn = gr.Button(t("unload"))
-                reload_btn = gr.Button(t("reload"))
-            preset_status = gr.Code(value=presets_text, language="json", label=t("preset_status"))
-            load_btn.click(load_preset, inputs=preset_dropdown, outputs=preset_status)
-            unload_btn.click(unload_model, outputs=preset_status)
-            reload_btn.click(reload_preset, inputs=preset_dropdown, outputs=preset_status)
-            with gr.Accordion(t("new_preset"), open=False):
-                with gr.Row():
-                    new_preset_id = gr.Textbox(value="trained-local", label=t("preset_id"))
-                    new_preset_name = gr.Textbox(value="Trained Local", label=t("name"))
-                new_preset_config = gr.Textbox(
-                    value=profile_path_text(DEFAULT_CONFIG_PATH),
-                    label=t("config_path"),
+                model_dropdown = gr.Dropdown(choices=initial_models, value=initial_model, label=t("voice_set_model"))
+                voice_dropdown = gr.Dropdown(
+                    choices=initial_voices,
+                    value=initial_voices[0] if initial_voices else registry.default_voice_id(),
+                    label=t("voice"),
                 )
-                new_preset_gpt = gr.Textbox(label=t("gpt_ckpt"))
-                new_preset_sovits = gr.Textbox(label=t("sovits_pth"))
-                save_preset_btn = gr.Button(t("save_preset"))
-                preset_save_status = gr.Textbox(label=t("save_result"))
-                save_preset_btn.click(
-                    write_model_preset,
-                    inputs=[
-                        new_preset_id,
-                        new_preset_name,
-                        new_preset_config,
-                        new_preset_gpt,
-                        new_preset_sovits,
-                    ],
-                    outputs=[preset_save_status, preset_dropdown, clone_model_preset],
-                )
+                refresh_choices_btn = gr.Button(t("refresh"))
+            default_preview_text = (
+                "Hello, this is a Neiroha GPT-SoVITS voice cloning test."
+                if language == "en"
+                else "你好，这是 Neiroha GPT-SoVITS 的语音复刻测试。"
+            )
+            text_input = gr.Textbox(value=default_preview_text, label=t("text"), lines=3)
+            with gr.Row():
+                format_dropdown = gr.Dropdown(choices=sorted(SUPPORTED_OPENAI_FORMATS), value="wav", label=t("format"))
+                speed_slider = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label=t("speed"))
+                synth_btn = gr.Button(t("generate"))
+            audio_output = gr.Audio(type="filepath", label=t("audio_output"))
+            metrics_box = gr.Code(label=t("metrics"), language="json")
+            model_dropdown.change(refresh_voice_dropdown, inputs=model_dropdown, outputs=voice_dropdown)
+            refresh_choices_btn.click(refresh_choices, inputs=model_dropdown, outputs=[model_dropdown, voice_dropdown])
+            synth_btn.click(
+                synthesize_preview,
+                inputs=[model_dropdown, voice_dropdown, text_input, format_dropdown, speed_slider],
+                outputs=[audio_output, metrics_box],
+            )
 
         with gr.Tab(t("download")):
             with gr.Row():
@@ -4468,6 +4717,21 @@ def build_gradio_admin_blocks(
             events_refresh_btn.click(runtime_events_text, outputs=events_box)
             log_timer = gr.Timer(value=2.0, active=True)
             log_timer.tick(runtime_events_text, outputs=events_box)
+
+        with gr.Tab(t("settings")):
+            settings_payload = {
+                "api_base": base,
+                "server_config": profile_path_text(SERVER_CONFIG_PATH),
+                "model_presets_dir": profile_path_text(MODEL_PRESETS_DIR),
+                "voice_sets_dir": profile_path_text(VOICE_SETS_DIR),
+                "runtime_dir": profile_path_text(RUNTIME_ROOT),
+                "startup": registry.server_config().get("startup", {}),
+            }
+            gr.Code(
+                value=json.dumps(settings_payload, ensure_ascii=False, indent=2),
+                language="json",
+                label=t("settings"),
+            )
 
     return blocks.queue(max_size=8, default_concurrency_limit=1)
 
@@ -4656,7 +4920,7 @@ def main() -> None:
     )
     requested_admin_port = (
         (args.port if effective_mode in {"admin", "api-admin"} else None)
-        or int(admin_config.get("port") or 17860)
+        or int(admin_config.get("port") or 7860)
     )
     starts_api = effective_mode in {"api", "api-admin", "combined"}
     starts_standalone_admin = effective_mode in {"admin", "api-admin"}
@@ -4674,7 +4938,9 @@ def main() -> None:
     admin_url = http_url(admin_host, admin_port) if starts_standalone_admin else ""
     default_voice = strip_text(args.default_voice) or registry.default_voice_id()
     if args.config == DEFAULT_CONFIG_PATH:
-        runtime.config_path = Path(registry.get_model_preset(registry.active_model_preset_id()).config_path).resolve()
+        active_preset = registry.get_model_preset(registry.active_model_preset_id())
+        runtime.config_path = Path(active_preset.config_path).resolve()
+        materialize_model_preset_config(active_preset, runtime.config_path)
 
     if preload_model and effective_mode != "admin":
         runtime.load()

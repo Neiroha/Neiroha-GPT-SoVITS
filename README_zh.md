@@ -43,14 +43,12 @@ Neiroha 自己维护的配置统一使用 TOML。唯一保留的 YAML 是
 
 ```powershell
 pixi install
-pixi run submodule-init
-pixi run install-deps
-pixi run install-assets
+pixi run install
 pixi run install-sample-voice
 ```
 
-`install-assets` 下载官方预训练资产。`install-sample-voice` 只下载一个默认示例参考音频，
-不会下载多角色训练权重。
+`install` 会初始化 submodule、安装 GPT-SoVITS 上游 Python 依赖并下载官方预训练资产。
+`install-sample-voice` 只下载一个默认示例参考音频，不会下载多角色训练权重。
 
 ## 启动
 
@@ -61,26 +59,27 @@ start_api_admin.bat
 或使用 Pixi task：
 
 ```powershell
+pixi run serve
 pixi run api
-pixi run api-preload
 pixi run admin
-pixi run api-admin
-pixi run api-admin-preload
+pixi run test
+pixi run smoke
 ```
 
 默认端口来自 `configs/server.toml`：
 
 ```text
-FastAPI  http://127.0.0.1:19880
-Admin    http://127.0.0.1:17860
+FastAPI  http://127.0.0.1:9880
+Admin    http://127.0.0.1:7860
 ```
 
-这些 Pixi task 默认不再写死端口；如果配置端口被占用或被 Windows 拒绝绑定，
-launcher 会自动挑一个可用随机端口，并在终端和 `runtime/logs/backend.log` 里写出实际地址。
-`api-12080` 仍然是显式覆盖端口的调试 task。
+`serve` 会读取 `configs/server.toml` 里的 `[startup].surface` 和
+`[startup].preload_model`。这些 Pixi task 不再写死 host、port、surface 组合或预加载策略；
+如果配置端口被占用或被 Windows 拒绝绑定，launcher 会自动挑一个可用随机端口，并在终端和
+`runtime/logs/backend.log` 里写出实际地址。
 
-`admin` 只启动 Gradio Admin，并连接已有 FastAPI。`api-admin` 会启动 FastAPI，
-再以独立子进程拉起 Gradio Admin；不再把 Gradio mount 到 FastAPI。
+`admin` 只启动 Gradio Admin，并连接已有 FastAPI。要同时启动 FastAPI 和 Gradio Admin，
+请设置 `[startup].surface = "both"` 后运行 `pixi run serve`；不再把 Gradio mount 到 FastAPI。
 
 ## Admin 语言
 
@@ -118,19 +117,19 @@ runtime/logs/admin-download.err.log
 列出 voice set：
 
 ```powershell
-curl.exe http://127.0.0.1:19880/v1/models
+curl.exe http://127.0.0.1:9880/v1/models
 ```
 
 列出 voice：
 
 ```powershell
-curl.exe http://127.0.0.1:19880/v1/audio/voices
+curl.exe http://127.0.0.1:9880/v1/audio/voices
 ```
 
 语音复刻：
 
 ```powershell
-curl.exe http://127.0.0.1:19880/v1/audio/speech `
+curl.exe http://127.0.0.1:9880/v1/audio/speech `
   -H "Content-Type: application/json" `
   -d '{ "model":"default", "voice":"genshin-keqing", "input":"你好，这是一次语音复刻测试。", "response_format":"wav" }' `
   --output speech.wav

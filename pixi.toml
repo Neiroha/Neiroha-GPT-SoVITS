@@ -4,6 +4,22 @@ channels = ["conda-forge"]
 platforms = ["win-64"]
 requires-pixi = ">=0.61.0"
 
+
+[tasks]
+submodule-init = { cmd = "git submodule update --init --recursive" }
+install-deps = { cmd = "python scripts/install_gpt_sovits_deps.py" }
+install-assets = { cmd = "python scripts/download_assets.py --source modelscope" }
+install-base = { cmd = "python scripts/download_assets.py --source modelscope" }
+install = { depends-on = ["submodule-init", "install-deps", "install-assets"] }
+install-sample-voice = { cmd = "python scripts/download_assets.py --source hf --skip-base-assets --sample-reference --activate-voices" }
+api = { cmd = "python scripts/launch_engine.py --surface api" }
+admin = { cmd = "python scripts/launch_engine.py --surface admin" }
+serve = { cmd = "python scripts/launch_engine.py" }
+test = { cmd = "python -m unittest discover tests" }
+smoke = { cmd = "python scripts/smoke_test_api.py" }
+launcher-help = { cmd = "python scripts/launch_gpt_sovits.py --help" }
+
+
 [system-requirements]
 cuda = "12.8"
 
@@ -30,16 +46,3 @@ requests = ">=2.32,<3"
 torch = { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.7.0%2Bcu128-cp311-cp311-win_amd64.whl" }
 torchaudio = { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchaudio-2.7.0%2Bcu128-cp311-cp311-win_amd64.whl" }
 torchvision = { url = "https://mirrors.aliyun.com/pytorch-wheels/cu128/torchvision-0.22.0%2Bcu128-cp311-cp311-win_amd64.whl" }
-
-[tasks]
-submodule-init = { cmd = "git submodule update --init --recursive" }
-install-deps = { cmd = "python scripts/install_gpt_sovits_deps.py" }
-install-assets = { cmd = "python scripts/download_gpt_sovits_assets.py --source modelscope" }
-install-sample-voice = { cmd = "python scripts/download_gpt_sovits_assets.py --source hf --skip-base-assets --sample-reference --activate-voices" }
-api = { cmd = "python scripts/launch_gpt_sovits.py --mode api" }
-api-11451 = { cmd = "python scripts/launch_gpt_sovits.py --mode api --port 11451" }
-api-preload = { cmd = "python scripts/launch_gpt_sovits.py --mode api-preload" }
-admin = { cmd = "python scripts/launch_gpt_sovits.py --mode admin" }
-api-admin = { cmd = "python scripts/launch_gpt_sovits.py --mode api-admin" }
-api-admin-preload = { cmd = "python scripts/launch_gpt_sovits.py --mode api-admin-preload" }
-launcher-help = { cmd = "python scripts/launch_gpt_sovits.py --help" }
