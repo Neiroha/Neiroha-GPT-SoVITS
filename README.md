@@ -61,7 +61,7 @@ multi-character packs.
 ## Run
 
 ```powershell
-start_api_admin.bat
+start_portable.bat serve
 ```
 
 Or use Pixi tasks:

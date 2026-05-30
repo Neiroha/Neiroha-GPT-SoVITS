@@ -53,7 +53,7 @@ pixi run install-sample-voice
 ## 启动
 
 ```powershell
-start_api_admin.bat
+start_portable.bat serve
 ```
 
 或使用 Pixi task：

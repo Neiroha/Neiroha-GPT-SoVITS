@@ -7,13 +7,14 @@ cd /d "%ROOT%"
 
 set "ENV_DIR=%ROOT%.pixi\envs\default"
 set "PY=%ENV_DIR%\python.exe"
-if not exist "%PY%" (
-  echo [ERROR] Bundled Python not found:
-  echo   %PY%
-  echo This portable package is incomplete.
-  pause
-  exit /b 1
-)
+if exist "%PY%" goto python_ok
+echo [ERROR] Bundled Python not found:
+echo   %PY%
+echo This portable package is incomplete. Please unpack all archive parts again.
+pause
+exit /b 1
+
+:python_ok
 
 if not exist "%ROOT%runtime\cache" mkdir "%ROOT%runtime\cache"
 if not exist "%ROOT%runtime\logs" mkdir "%ROOT%runtime\logs"
@@ -42,21 +43,22 @@ if /I "%~1"=="--help" goto help
 
 :menu
 echo.
-echo Neiroha GPT-SoVITS Portable
-echo ===========================
-echo 1. API + Admin
-echo 2. API only
-echo 3. Admin only
-echo 4. Official GPT-SoVITS WebUI
-echo 5. Help
+call :say title
+echo =========================
+call :say menu_serve
+call :say menu_api
+call :say menu_admin
+call :say menu_webui
+call :say menu_help
 echo.
-set /p "choice=Select [1-5]: "
+call :say prompt nonewline
+set /p "choice="
 if "%choice%"=="1" goto serve
 if "%choice%"=="2" goto api
 if "%choice%"=="3" goto admin
 if "%choice%"=="4" goto webui
 if "%choice%"=="5" goto help
-echo Invalid choice.
+call :say invalid
 goto menu
 
 :serve
@@ -77,12 +79,16 @@ exit /b %ERRORLEVEL%
 
 :help
 echo.
-echo Usage:
-echo   start_portable.bat              Show menu
-echo   start_portable.bat serve        Start API + Admin
-echo   start_portable.bat api          Start API only
-echo   start_portable.bat admin        Start Admin only
-echo   start_portable.bat webui        Start official GPT-SoVITS WebUI
+call :say usage
+call :say help_menu
+call :say help_serve
+call :say help_api
+call :say help_admin
+call :say help_webui
 echo.
-echo The launcher uses only files under this unpacked directory.
+call :say note
 exit /b 0
+
+:say
+"%PY%" -X utf8 -c "import sys; messages={'title':'Neiroha GPT-SoVITS \u4fbf\u643a\u7248','menu_serve':'1. \u542f\u52a8 API + Admin','menu_api':'2. \u4ec5\u542f\u52a8 API','menu_admin':'3. \u4ec5\u542f\u52a8 Admin','menu_webui':'4. \u542f\u52a8 GPT-SoVITS \u5b98\u65b9 WebUI','menu_help':'5. \u5e2e\u52a9','prompt':'\u8bf7\u9009\u62e9 [1-5]\uff1a','invalid':'\u65e0\u6548\u9009\u62e9\uff0c\u8bf7\u91cd\u65b0\u8f93\u5165\u3002','usage':'\u7528\u6cd5\uff1a','help_menu':'  start_portable.bat              \u663e\u793a\u83dc\u5355','help_serve':'  start_portable.bat serve        \u542f\u52a8 API + Admin','help_api':'  start_portable.bat api          \u4ec5\u542f\u52a8 API','help_admin':'  start_portable.bat admin        \u4ec5\u542f\u52a8 Admin','help_webui':'  start_portable.bat webui        \u542f\u52a8 GPT-SoVITS \u5b98\u65b9 WebUI','note':'\u542f\u52a8\u5668\u53ea\u4f7f\u7528\u5f53\u524d\u89e3\u538b\u76ee\u5f55\u5185\u7684\u6587\u4ef6\u3002'}; text=messages[sys.argv[1]]; end='' if len(sys.argv)>2 and sys.argv[2]=='nonewline' else '\n'; sys.stdout.write(text+end); sys.stdout.flush()" "%~1" "%~2"
+exit /b %ERRORLEVEL%

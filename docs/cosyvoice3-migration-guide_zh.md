@@ -47,7 +47,7 @@ API 形状：
 
 ```text
 Neiroha-CosyVoice3/
-  start_api_admin.bat
+  start_portable.bat
   pixi.toml
   scripts/
     launch_cosyvoice3.py
@@ -222,7 +222,7 @@ Gradio 不会自动翻译自定义 label。CosyVoice3 Admin 要自己维护 `zh`
 - 可用 voice 数
 - 进程 PID / 状态
 
-从 `start_api_admin.bat` 启动后，首页必须自动刷新 API 状态，不要求用户手动点刷新。
+从 `start_portable.bat serve` 或 `pixi run serve` 启动后，首页必须自动刷新 API 状态，不要求用户手动点刷新。
 
 ## Gradio 日志页要求
 
