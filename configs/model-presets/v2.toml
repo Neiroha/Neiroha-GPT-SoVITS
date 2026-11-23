@@ -1,0 +1,10 @@
+schema_version = 1
+id = "v2"
+name = "GPT-SoVITS v2"
+engine = "gpt-sovits"
+
+[gpt_sovits]
+version = "v2"
+config_path = "runtime/cache/v2.yaml"
+gpt_weights_path = "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt"
+sovits_weights_path = "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth"

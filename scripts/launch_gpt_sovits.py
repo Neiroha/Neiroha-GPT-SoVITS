@@ -34,6 +34,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+if __package__:
+    from .download_gpt_sovits_assets import prepare_inference_compat_assets
+else:
+    from download_gpt_sovits_assets import prepare_inference_compat_assets
+
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -971,7 +976,8 @@ class TTSRequest(BaseModel):
     streaming_mode: Union[bool, int] = False
     parallel_infer: bool = True
     repetition_penalty: float = 1.35
-    sample_steps: int = 32
+    sample_steps: Optional[int] = Field(default=None, ge=1)
+    cfg_rate: Optional[float] = Field(default=None, ge=0)
     super_sampling: bool = False
     overlap_length: int = 2
     min_chunk_length: int = 16
@@ -1005,7 +1011,8 @@ class OpenAISpeechRequest(BaseModel):
     temperature: float = 1
     seed: int = -1
     repetition_penalty: float = 1.35
-    sample_steps: int = 32
+    sample_steps: Optional[int] = Field(default=None, ge=1)
+    cfg_rate: Optional[float] = Field(default=None, ge=0)
     super_sampling: bool = False
 
 
@@ -1032,11 +1039,13 @@ class CloneSpeechRequest(BaseModel):
     temperature: float = 1
     seed: int = -1
     repetition_penalty: float = 1.35
-    sample_steps: int = 32
+    sample_steps: Optional[int] = Field(default=None, ge=1)
+    cfg_rate: Optional[float] = Field(default=None, ge=0)
     super_sampling: bool = False
 
 
 class LoadRequest(BaseModel):
+    model_preset: Optional[str] = None
     config_path: Optional[str] = None
     gpt_weights_path: Optional[str] = None
     sovits_weights_path: Optional[str] = None
@@ -1085,6 +1094,7 @@ class GPTSoVITSRuntime:
                 f"GPT-SoVITS submodule is missing: {self.repo_dir}. "
                 "Run `git submodule update --init --recursive` first."
             )
+        prepare_inference_compat_assets(self.repo_dir)
         for path in (self.repo_dir, self.repo_dir / "GPT_SoVITS"):
             path_text = str(path)
             if path_text not in sys.path:
@@ -1200,6 +1210,10 @@ class GPTSoVITSRuntime:
             pipeline = self.get_or_load()
             with runtime_output_scope(self.debug_runtime_output):
                 pipeline.init_vits_weights(resolved)
+            # Reference features depend on the SoVITS weights and sample rate.
+            pipeline.prompt_cache.update(
+                ref_audio_path=None, refer_spec=[], prompt_semantic=None, aux_ref_audio_paths=[]
+            )
             self.current_sovits_weights_path = resolved
             status = self.status()
             RUNTIME_EVENTS.append(
@@ -1306,8 +1320,11 @@ class GPTSoVITSRuntime:
         request["fixed_length_chunk"] = fixed_length_chunk
         return request, bool(streaming_mode or return_fragment)
 
-    def synthesize_once(self, request: dict[str, Any]) -> tuple[int, np.ndarray]:
+    def synthesize_once(
+        self, request: dict[str, Any], *, profile: Optional[VoiceProfile] = None
+    ) -> tuple[int, np.ndarray]:
         with self.lock:
+            self.apply_profile_weights(profile)
             pipeline = self.get_or_load()
             request = self.validate_request(request)
             request, is_streaming = self.normalize_streaming_mode(request)
@@ -1367,7 +1384,8 @@ def native_request_from_query(
     streaming_mode: Union[bool, int],
     parallel_infer: bool,
     repetition_penalty: float,
-    sample_steps: int,
+    sample_steps: Optional[int],
+    cfg_rate: Optional[float],
     super_sampling: bool,
     overlap_length: int,
     min_chunk_length: int,
@@ -1394,6 +1412,7 @@ def native_request_from_query(
         "parallel_infer": parallel_infer,
         "repetition_penalty": repetition_penalty,
         "sample_steps": sample_steps,
+        "cfg_rate": cfg_rate,
         "super_sampling": super_sampling,
         "overlap_length": overlap_length,
         "min_chunk_length": min_chunk_length,
@@ -1410,9 +1429,12 @@ def request_with_profile(
     data = model_dump(payload)
     model_id = strip_text(data.get("model"))
     voice_id = extract_voice_id(data.get("voice"))
+    explicit_voice = voice_id not in {"", "default"}
     if voice_id in {"", "default"} and strip_text(default_voice_id):
         voice_id = strip_text(default_voice_id)
     profile = registry.get(voice_id, model_id=model_id)
+    if profile is None and explicit_voice and model_id in {"", DEFAULT_VOICE_SET_ID, *LEGACY_OPENAI_MODEL_ALIASES}:
+        profile = registry.get(voice_id)
     if profile is None and voice_id in {"", "default"}:
         profile = registry.first(model_id)
 
@@ -1449,7 +1471,8 @@ def request_with_profile(
         "streaming_mode": False,
         "parallel_infer": True,
         "repetition_penalty": data.get("repetition_penalty", 1.35),
-        "sample_steps": data.get("sample_steps", 32),
+        "sample_steps": data.get("sample_steps"),
+        "cfg_rate": data.get("cfg_rate"),
         "super_sampling": data.get("super_sampling", False),
         "overlap_length": 2,
         "min_chunk_length": 16,
@@ -1507,7 +1530,8 @@ def request_with_clone(
         "streaming_mode": False,
         "parallel_infer": True,
         "repetition_penalty": data.get("repetition_penalty", 1.35),
-        "sample_steps": data.get("sample_steps", 32),
+        "sample_steps": data.get("sample_steps"),
+        "cfg_rate": data.get("cfg_rate"),
         "super_sampling": data.get("super_sampling", False),
         "overlap_length": 2,
         "min_chunk_length": 16,
@@ -1884,7 +1908,11 @@ def create_api_app(
 
     @app.post("/v1/audio/speech")
     def openai_audio_speech(payload: OpenAISpeechRequest):
-        if payload.model and payload.model not in LEGACY_OPENAI_MODEL_ALIASES and not registry.has_voice_set(payload.model):
+        if (
+            payload.model
+            and payload.model not in {DEFAULT_VOICE_SET_ID, *LEGACY_OPENAI_MODEL_ALIASES}
+            and not registry.has_voice_set(payload.model)
+        ):
             return openai_error(
                 f"Unknown voice set model='{payload.model}'. Use GET /v1/models.",
                 status_code=400,
@@ -1900,8 +1928,7 @@ def create_api_app(
                 registry=registry,
                 default_voice_id=default_voice_id,
             )
-            runtime.apply_profile_weights(profile)
-            sample_rate, audio_data = runtime.synthesize_once(request)
+            sample_rate, audio_data = runtime.synthesize_once(request, profile=profile)
             speaker = profile.id if profile else extract_voice_id(payload.voice) or default_voice_id or "default"
             metrics = log_rtf(
                 rtf_log,
@@ -1945,8 +1972,7 @@ def create_api_app(
                 request["ref_audio_path"],
                 repo_dir=runtime.repo_dir,
             )
-            runtime.apply_profile_weights(profile)
-            sample_rate, audio_data = runtime.synthesize_once(request)
+            sample_rate, audio_data = runtime.synthesize_once(request, profile=profile)
             metrics = log_rtf(
                 rtf_log,
                 mode="clone",
@@ -1997,7 +2023,8 @@ def create_api_app(
         streaming_mode: Union[bool, int] = False,
         parallel_infer: bool = True,
         repetition_penalty: float = 1.35,
-        sample_steps: int = 32,
+        sample_steps: Optional[int] = Query(None, ge=1),
+        cfg_rate: Optional[float] = Query(None, ge=0),
         super_sampling: bool = False,
         overlap_length: int = 2,
         min_chunk_length: int = 16,
@@ -2024,6 +2051,7 @@ def create_api_app(
             parallel_infer=parallel_infer,
             repetition_penalty=repetition_penalty,
             sample_steps=sample_steps,
+            cfg_rate=cfg_rate,
             super_sampling=super_sampling,
             overlap_length=overlap_length,
             min_chunk_length=min_chunk_length,
@@ -2157,8 +2185,7 @@ def create_api_app(
                 request["ref_audio_path"],
                 repo_dir=runtime.repo_dir,
             )
-            runtime.apply_profile_weights(profile)
-            sample_rate, audio_data = runtime.synthesize_once(request)
+            sample_rate, audio_data = runtime.synthesize_once(request, profile=profile)
             metrics = log_rtf(
                 rtf_log,
                 mode="clone-upload",
@@ -2190,6 +2217,8 @@ def create_api_app(
     @app.post("/gpt-sovits/load")
     def load_model(payload: LoadRequest):
         try:
+            if payload.model_preset:
+                return load_preset(payload.model_preset)
             status = runtime.load(payload.config_path)
             if payload.gpt_weights_path:
                 status = runtime.set_gpt_weights(payload.gpt_weights_path)
@@ -2208,9 +2237,19 @@ def create_api_app(
     @app.post("/gpt-sovits/reload")
     def reload_model(payload: LoadRequest):
         try:
+            if payload.model_preset:
+                return load_preset(payload.model_preset)
             return runtime.reload(payload.config_path)
         except Exception as exc:
             return openai_error(str(exc), status_code=400)
+
+    def load_preset(preset_id: str) -> dict[str, Any]:
+        preset = registry.get_model_preset(preset_id)
+        with runtime.lock:
+            config_path = materialize_model_preset_config(preset, Path(preset.config_path))
+            status = runtime.reload(str(config_path))
+            runtime.config_path = config_path
+            return status
 
     @app.get("/api/gpt-sovits/set_refer_audio")
     @app.get("/set_refer_audio")
@@ -2327,8 +2366,7 @@ def build_gradio_blocks(runtime: GPTSoVITSRuntime, registry: VoiceRegistry):
             "text_split_method": "cut5",
             "batch_size": 1,
         }
-        runtime.apply_profile_weights(profile)
-        sample_rate, audio_data = runtime.synthesize_once(request)
+        sample_rate, audio_data = runtime.synthesize_once(request, profile=profile)
         return sample_rate, audio_data
 
     with gr.Blocks(title="Neiroha GPT-SoVITS") as blocks:
@@ -4304,15 +4342,10 @@ def build_gradio_admin_blocks(
         )
 
     def load_preset(preset_id: str) -> str:
-        preset = registry.get_model_preset(preset_id)
         return request_json(
             "POST",
             "/gpt-sovits/load",
-            json={
-                "config_path": preset.config_path,
-                "gpt_weights_path": preset.gpt_weights_path,
-                "sovits_weights_path": preset.sovits_weights_path,
-            },
+            json={"model_preset": preset_id},
         )
 
     def load_active_preset() -> str:
@@ -4330,27 +4363,23 @@ def build_gradio_admin_blocks(
         return home_refresh()
 
     def reload_preset(preset_id: str) -> str:
-        preset = registry.get_model_preset(preset_id)
         return request_json(
             "POST",
             "/gpt-sovits/reload",
-            json={
-                "config_path": preset.config_path,
-                "gpt_weights_path": preset.gpt_weights_path,
-                "sovits_weights_path": preset.sovits_weights_path,
-            },
+            json={"model_preset": preset_id},
         )
 
     def write_model_preset(
         preset_id: str,
         preset_name: str,
+        version: str,
         config_path: str,
         gpt_weights_path: str,
         sovits_weights_path: str,
     ) -> tuple[str, Any, Any]:
         preset_id = safe_filename_part(preset_id, fallback="trained-preset")
         preset_name = strip_text(preset_name) or preset_id
-        config_path = strip_text(config_path) or profile_path_text(DEFAULT_CONFIG_PATH)
+        config_path = strip_text(config_path) or f"runtime/cache/{preset_id}.yaml"
         gpt_weights_path = strip_text(gpt_weights_path)
         sovits_weights_path = strip_text(sovits_weights_path)
         if not gpt_weights_path or not sovits_weights_path:
@@ -4371,6 +4400,7 @@ def build_gradio_admin_blocks(
                     'engine = "gpt-sovits"',
                     "",
                     "[gpt_sovits]",
+                    f"version = {toml_string(version)}",
                     f"config_path = {toml_string(config_path_text)}",
                     f"gpt_weights_path = {toml_string(gpt_weights_text)}",
                     f"sovits_weights_path = {toml_string(sovits_weights_text)}",
@@ -4501,6 +4531,7 @@ def build_gradio_admin_blocks(
     def write_model_preset_for_tab(
         preset_id: str,
         preset_name: str,
+        version: str,
         config_path: str,
         gpt_weights_path: str,
         sovits_weights_path: str,
@@ -4508,6 +4539,7 @@ def build_gradio_admin_blocks(
         status, preset_update, _clone_update = write_model_preset(
             preset_id,
             preset_name,
+            version,
             config_path,
             gpt_weights_path,
             sovits_weights_path,
@@ -4589,8 +4621,13 @@ def build_gradio_admin_blocks(
                 with gr.Row():
                     new_preset_id = gr.Textbox(value="trained-local", label=t("preset_id"))
                     new_preset_name = gr.Textbox(value="Trained Local", label=t("name"))
+                    new_preset_version = gr.Dropdown(
+                        choices=["v1", "v2", "v2Pro", "v2ProPlus", "v3", "v4", "v5turbo", "v5dev"],
+                        value="v2ProPlus",
+                        label="GPT-SoVITS",
+                    )
                 new_preset_config = gr.Textbox(
-                    value=profile_path_text(DEFAULT_CONFIG_PATH),
+                    placeholder="runtime/cache/<preset_id>.yaml",
                     label=t("config_path"),
                 )
                 new_preset_gpt = gr.Textbox(label=t("gpt_ckpt"))
@@ -4602,6 +4639,7 @@ def build_gradio_admin_blocks(
                     inputs=[
                         new_preset_id,
                         new_preset_name,
+                        new_preset_version,
                         new_preset_config,
                         new_preset_gpt,
                         new_preset_sovits,
@@ -4944,8 +4982,8 @@ def main() -> None:
 
     if preload_model and effective_mode != "admin":
         runtime.load()
-        default_profile = registry.get(default_voice)
-        if default_profile is not None:
+        default_profile = registry.get(default_voice, model_id=registry.active_voice_set_id())
+        if default_profile is not None and default_profile.model_preset == registry.active_model_preset_id():
             runtime.apply_profile_weights(default_profile)
 
     RUNTIME_EVENTS.append(

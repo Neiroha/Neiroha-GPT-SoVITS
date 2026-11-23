@@ -53,6 +53,34 @@ pixi run install
 pixi run install-sample-voice
 ```
 
+### Inference model presets
+
+The Windows portable package bundles official v2, v2ProPlus, v4, v5turbo, and
+v5dev weights. After a source installation, run this command to fetch the additional weights.
+
+```powershell
+pixi run python scripts/download_assets.py --skip-base-assets --models v2 v4 v5turbo v5dev
+```
+
+[Moear's Azur Lane fine-tunes](https://huggingface.co/Moear) are optional.
+Install them with the portable command below or pass their IDs to `--models`
+in a source installation. The V5 presets fetch the official base model and
+vocoder required by the SoVITS LoRA.
+
+```powershell
+.\start_portable.bat models azurlane-v2proplus azurlane-v5turbo azurlane-v5dev
+```
+
+Restart Admin after installation, then use Model Presets to load a model or
+Clone Setup to attach it to a voice with reference audio and its transcript.
+V4, V5turbo, and V5dev require the reference transcript. Requests with
+`model="default"` can find an explicitly named voice in another set and use
+that voice's assigned weights.
+
+Native API clients can select a preset by posting `{"model_preset":"v5turbo"}`
+to `/api/gpt-sovits/load`. Leave `sample_steps` and `cfg_rate` unset to use
+the upstream defaults for the loaded architecture.
+
 `install` initializes the submodule, installs upstream GPT-SoVITS Python
 dependencies, and downloads the official pretrained assets. `install-sample-voice`
 downloads only one default sample reference voice; it does not download trained

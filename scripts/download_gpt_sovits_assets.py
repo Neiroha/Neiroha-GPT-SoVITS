@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.request
 import wave
@@ -112,26 +114,35 @@ SOURCES = {
 
 HF_PRETRAINED_PREFIX = "https://huggingface.co/XXXXRT/GPT-SoVITS-Pretrained/resolve/main/"
 
-V2PRO_PLUS_FILES = {
-    "s1v3.ckpt": PRETRAINED_DIR / "s1v3.ckpt",
-    "v2Pro/s2Gv2ProPlus.pth": PRETRAINED_DIR / "v2Pro" / "s2Gv2ProPlus.pth",
-    "sv/pretrained_eres2netv2w24s4ep4.ckpt": PRETRAINED_DIR
-    / "sv"
-    / "pretrained_eres2netv2w24s4ep4.ckpt",
+OFFICIAL_MODEL_REPO = "lj1995/GPT-SoVITS"
+OFFICIAL_MODEL_REVISION = "8f8857563c040d542de108a2c18b0425abd6c9c5"
+BASE_MODEL_FILES = {
+    "v2": (
+        "gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt",
+        "gsv-v2final-pretrained/s2G2333k.pth",
+    ),
+    "v2ProPlus": ("s1v3.ckpt", "v2Pro/s2Gv2ProPlus.pth", "sv/pretrained_eres2netv2w24s4ep4.ckpt"),
+    "v4": ("s1v3.ckpt", "gsv-v4-pretrained/s2Gv4.pth", "gsv-v4-pretrained/vocoder.pth"),
+    "v5turbo": ("s1v3.ckpt", "gsv-v5-pretrained/s2Gv5turbo.pth", "gsv-v5-pretrained/vocoder.pth"),
+    "v5dev": ("s1v3.ckpt", "gsv-v5-pretrained/s2Gv5dev.pth", "gsv-v5-pretrained/vocoder.pth"),
 }
-
-UNUSED_PRETRAINED_PATHS = [
-    "s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt",
-    "s2G488k.pth",
-    "s2D488k.pth",
-    "s2Gv3.pth",
-    "gsv-v2final-pretrained",
-    "gsv-v4-pretrained",
-    "models--nvidia--bigvgan_v2_24khz_100band_256x",
-    "v2Pro/s2Gv2Pro.pth",
-    "v2Pro/s2Dv2Pro.pth",
-    "v2Pro/s2Dv2ProPlus.pth",
-]
+AZURLANE_MODELS = {
+    "azurlane-v2proplus": (
+        "v2ProPlus", "Moear/AzurLane-GPT-SoVITS-v2ProPlus", "40750a1e7c185d7b1f1a0ffb1d74bd7491a15de7",
+        "all-characters/s1/azur-lane-all-v2proplus-20261119-e14.ckpt",
+        "all-characters/s2/azur-lane-all-v2proplus-20261119_e8_s12712.pth",
+    ),
+    "azurlane-v5turbo": (
+        "v5turbo", "Moear/AzurLane-GPT-SoVITS-V5turbo", "c306e2c8c4506ee95df457cefa52b4c5d632b270",
+        "weights/s1/azur-lane-all-v5turbo-20261121-e15.ckpt",
+        "weights/s2/azur-lane-all-v5turbo-20261121_e1_s2119_l32.pth",
+    ),
+    "azurlane-v5dev": (
+        "v5dev", "Moear/AzurLane-GPT-SoVITS-V5dev", "cd45767a007d85310bbf8f27d2b98200796a1f0c",
+        "weights/s1/azur-lane-all-v5dev-20261121-e15.ckpt",
+        "weights/s2/azur-lane-all-v5dev-20261121_e1_s2119_l32.pth",
+    ),
+}
 
 GENSHIN_REPO_ID = "UnlimitedBurst/GPT-SoVITS"
 GENSHIN_ROOT = "原神（已更新4.8）"
@@ -229,6 +240,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", choices=sorted(SOURCES), default="modelscope")
     parser.add_argument("--download-uvr5", action="store_true")
     parser.add_argument(
+        "--models", nargs="+", choices=("v2", "v4", "v5turbo", "v5dev", *AZURLANE_MODELS),
+        default=[], help="Install the selected inference model presets and their base assets.",
+    )
+    parser.add_argument(
         "--v2pro-plus",
         action="store_true",
         help="Download official v2ProPlus weights from Hugging Face into models/pretrained.",
@@ -288,18 +303,9 @@ def download(url: str, target: Path, *, force: bool = False) -> Path:
     return target
 
 
-def download_huggingface_file(repo_id: str, repo_path: str, target: Path, *, force: bool) -> None:
-    if target.exists() and not force:
-        print(f"Exists, skipping: {target}")
-        return
-    url = f"https://huggingface.co/{repo_id}/resolve/main/{repo_path}?download=true"
-    archive = download(url, DOWNLOAD_DIR / repo_path.replace("/", "__"), force=force)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Copying {archive} -> {target}")
-    shutil.copyfile(archive, target)
-
-
-def download_huggingface_model_file(repo_id: str, repo_path: str, target: Path, *, force: bool) -> None:
+def download_huggingface_model_file(
+    repo_id: str, repo_path: str, target: Path, *, force: bool, revision: str | None = None
+) -> None:
     if target.exists() and not force:
         print(f"Exists, skipping: {target}")
         return
@@ -309,8 +315,6 @@ def download_huggingface_model_file(repo_id: str, repo_path: str, target: Path, 
         raise SystemExit("huggingface_hub is required. Run `pixi run install-deps` first.") from exc
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists() and force:
-        target.unlink()
     print(f"Downloading HF model file: {repo_id}/{repo_path}")
     downloaded = None
     for attempt in range(1, 4):
@@ -320,6 +324,7 @@ def download_huggingface_model_file(repo_id: str, repo_path: str, target: Path, 
                     repo_id=repo_id,
                     filename=repo_path,
                     repo_type="model",
+                    revision=revision,
                     force_download=force,
                 )
             )
@@ -335,7 +340,7 @@ def download_huggingface_model_file(repo_id: str, repo_path: str, target: Path, 
     if downloaded is None:
         raise RuntimeError(f"Failed to download {repo_id}/{repo_path}")
     print(f"Copying {downloaded} -> {target}")
-    shutil.copyfile(downloaded, target)
+    copy_asset(downloaded, target)
 
 
 def extract_zip(zip_path: Path, target_dir: Path) -> None:
@@ -356,22 +361,7 @@ def sync_compat_tree(source: Path, target: Path) -> None:
     if not source.exists():
         return
     target.parent.mkdir(parents=True, exist_ok=True)
-    if target.exists():
-        shutil.rmtree(target)
-    shutil.copytree(source, target)
-
-
-def prune_unused_pretrained_assets() -> None:
-    for root in (PRETRAINED_DIR, COMPAT_PRETRAINED_DIR):
-        for relative_path in UNUSED_PRETRAINED_PATHS:
-            target = root / relative_path
-            if not target.exists():
-                continue
-            if target.is_dir():
-                shutil.rmtree(target)
-            else:
-                target.unlink()
-            print(f"Pruned unused pretrained asset: {target}")
+    shutil.copytree(source, target, dirs_exist_ok=True, copy_function=copy_asset)
 
 
 def maybe_download_pretrained(urls: dict[str, str], *, force: bool) -> None:
@@ -437,17 +427,89 @@ def maybe_download_uvr5(urls: dict[str, str], *, force: bool) -> None:
 
 def maybe_download_v2pro_plus(*, force: bool) -> None:
     print("Downloading GPT-SoVITS v2ProPlus weights from Hugging Face.")
-    for repo_path, target in V2PRO_PLUS_FILES.items():
-        download_huggingface_file("lj1995/GPT-SoVITS", repo_path, target, force=force)
-        compat_target = COMPAT_PRETRAINED_DIR / repo_path
-        compat_target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(target, compat_target)
+    download_base_model("v2ProPlus", force=force)
     print("")
     print("v2ProPlus local paths")
     print(f"GPT weights : {PRETRAINED_DIR / 's1v3.ckpt'}")
     print(f"SoVITS G    : {PRETRAINED_DIR / 'v2Pro' / 's2Gv2ProPlus.pth'}")
     print(f"SV model    : {PRETRAINED_DIR / 'sv' / 'pretrained_eres2netv2w24s4ep4.ckpt'}")
 
+
+def download_base_model(version: str, *, force: bool) -> None:
+    for filename in BASE_MODEL_FILES[version]:
+        target = PRETRAINED_DIR / filename
+        download_huggingface_model_file(
+            OFFICIAL_MODEL_REPO, filename, target, revision=OFFICIAL_MODEL_REVISION, force=force
+        )
+        sync_compat_file(target, COMPAT_PRETRAINED_DIR / filename, force=force)
+
+
+def install_inference_preset(preset_id: str, *, force: bool) -> None:
+    custom = AZURLANE_MODELS.get(preset_id)
+    version = custom[0] if custom else preset_id
+    download_base_model(version, force=force)
+    model_dir = PRETRAINED_DIR
+    gpt_file, sovits_file = BASE_MODEL_FILES[version][:2]
+    name = f"GPT-SoVITS {version}"
+    if custom:
+        _, repo, revision, gpt_file, sovits_file = custom
+        model_dir = MODELS_ROOT / "azurlane" / version.lower()
+        name = f"Azur Lane {version}"
+        for filename in (gpt_file, sovits_file):
+            download_huggingface_model_file(
+                repo, filename, model_dir / filename, revision=revision, force=force
+            )
+
+    preset_path = WORKSPACE_ROOT / "configs" / "model-presets" / f"{preset_id}.toml"
+    if not preset_path.exists():
+        write_toml_mapping(
+            preset_path,
+            {
+                "schema_version": 1,
+                "id": preset_id,
+                "name": name,
+                "engine": "gpt-sovits",
+                "gpt_sovits": {
+                    "version": version,
+                    "config_path": f"runtime/cache/{preset_id}.yaml",
+                    "gpt_weights_path": workspace_relative(model_dir / gpt_file),
+                    "sovits_weights_path": workspace_relative(model_dir / sovits_file),
+                },
+            },
+        )
+    print(f"Installed model preset: {preset_path}")
+
+
+def copy_asset(source: Path | str, target: Path | str) -> None:
+    target = Path(target)
+    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+        temporary_path = Path(stream.name)
+    try:
+        shutil.copyfile(source, temporary_path)
+        temporary_path.replace(target)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def sync_compat_file(source: Path, target: Path, *, force: bool = False) -> None:
+    if not source.is_file() or (target.is_file() and not force):
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not force:
+        try:
+            os.link(source, target)
+            return
+        except FileExistsError:
+            return
+        except OSError:
+            pass
+    copy_asset(source, target)
+
+
+def prepare_inference_compat_assets(repo_dir: Path) -> None:
+    compat_root = repo_dir / "GPT_SoVITS" / "pretrained_models"
+    for filename in {filename for files in BASE_MODEL_FILES.values() for filename in files}:
+        sync_compat_file(PRETRAINED_DIR / filename, compat_root / filename)
 
 def split_speakers(raw_speakers: str) -> list[str]:
     speakers = [speaker.strip() for speaker in raw_speakers.split(",") if speaker.strip()]
@@ -907,7 +969,8 @@ def main() -> None:
         maybe_download_v2pro_plus(force=args.force)
     if args.sample_reference:
         maybe_download_sample_reference(activate=args.activate_voices, force=args.force)
-    prune_unused_pretrained_assets()
+    for preset_id in args.models:
+        install_inference_preset(preset_id, force=args.force)
     print("Asset download step finished.")
 
 

@@ -47,6 +47,24 @@ pixi run install
 pixi run install-sample-voice
 ```
 
+### 安装并切换推理权重
+
+Windows 一键包内置官方 v2、v2ProPlus、v4、v5turbo 和 v5dev。源码安装完成后可以补齐这些预设。
+
+```powershell
+pixi run python scripts/download_assets.py --skip-base-assets --models v2 v4 v5turbo v5dev
+```
+
+[Moear 的碧蓝航线权重](https://huggingface.co/Moear)可以按需安装。一键包运行下面的命令，源码安装则把对应的预设 ID 传给上面的 `--models`。V5 预设会同时准备对应的官方底模与声码器，用于加载 SoVITS LoRA。
+
+```powershell
+.\start_portable.bat models azurlane-v2proplus azurlane-v5turbo azurlane-v5dev
+```
+
+重启 Admin 后，可在「模型预设」页加载所需版本，或在「克隆配置」页为角色选定预设、参考音频和对应文本。V4、V5turbo 和 V5dev 推理需要这段参考文本。客户端传入 `model="default"` 和明确的角色 ID 时，后端会在默认语音集找不到角色的情况下查找其他语音集，并使用角色绑定的权重。
+
+原生 API 可向 `/api/gpt-sovits/load` 提交 `{"model_preset":"v5turbo"}` 来切换预设。省略 `sample_steps` 和 `cfg_rate` 时，推理引擎会按当前模型版本使用上游默认值。
+
 `install` 会初始化 submodule、安装 GPT-SoVITS 上游 Python 依赖并下载官方预训练资产。
 `install-sample-voice` 只下载一个默认示例参考音频，不会下载多角色训练权重。
 

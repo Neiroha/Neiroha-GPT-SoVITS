@@ -1,0 +1,10 @@
+schema_version = 1
+id = "v4"
+name = "GPT-SoVITS v4"
+engine = "gpt-sovits"
+
+[gpt_sovits]
+version = "v4"
+config_path = "runtime/cache/v4.yaml"
+gpt_weights_path = "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/s1v3.ckpt"
+sovits_weights_path = "models/pretrained/GPT-SoVITS/GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"

@@ -5,8 +5,14 @@ import fnmatch
 import os
 import shutil
 import subprocess
-import sys
+import tempfile
+import zipfile
 from pathlib import Path
+
+if __package__:
+    from .download_gpt_sovits_assets import BASE_MODEL_FILES, PRETRAINED_DIR, PRETRAINED_PACKAGE_DIR
+else:
+    from download_gpt_sovits_assets import BASE_MODEL_FILES, PRETRAINED_DIR, PRETRAINED_PACKAGE_DIR
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +27,7 @@ EXCLUDE_DIR_NAMES = {
     "__pycache__",
     ".pytest_cache",
     ".mypy_cache",
+    "conda-meta",
     "task-cache-v0",
 }
 
@@ -29,33 +36,10 @@ EXCLUDE_FILE_PATTERNS = {
     "*.pyo",
     "*.tmp",
     "*.log",
+    "direct_url.json",
 }
 
-EXCLUDE_RELATIVE_PATHS = {
-    Path("GPT-SoVITS/GPT_SoVITS/pretrained_models/chinese-hubert-base"),
-    Path("GPT-SoVITS/GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large"),
-    Path("GPT-SoVITS/GPT_SoVITS/pretrained_models/g2pw-chinese"),
-    Path("GPT-SoVITS/GPT_SoVITS/pretrained_models/s1v3.ckpt"),
-    Path("GPT-SoVITS/GPT_SoVITS/pretrained_models/v2Pro"),
-}
-
-COPY_PATHS = [
-    ".pixi/envs/default",
-    "app",
-    "configs",
-    "docs",
-    "GPT-SoVITS",
-    "models",
-    "profiles",
-    "runtime/voices",
-    "scripts",
-    ".gitmodules",
-    "pixi.lock",
-    "pixi.toml",
-    "README.md",
-    "README_zh.md",
-    "start_portable.bat",
-]
+ENVIRONMENT = Path(".pixi/envs/default")
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,22 +75,9 @@ def ensure_under_root(path: Path, parent: Path) -> Path:
 
 
 def should_exclude(path: Path) -> bool:
-    try:
-        relative = path.resolve().relative_to(ROOT.resolve())
-    except ValueError:
-        relative = None
-    if relative is not None:
-        for excluded in EXCLUDE_RELATIVE_PATHS:
-            if relative == excluded or excluded in relative.parents:
-                return True
     if path.name in EXCLUDE_DIR_NAMES:
         return True
     if path.is_file() and any(fnmatch.fnmatch(path.name, pattern) for pattern in EXCLUDE_FILE_PATTERNS):
-        return True
-    parts = set(path.parts)
-    if "runtime" in parts and any(name in parts for name in {"cache", "logs", "outputs", "temp"}):
-        return True
-    if "modelscope" in parts and "runtime" in parts and "cache" in parts:
         return True
     return False
 
@@ -130,8 +101,7 @@ def link_or_copy(src: str, dst: str) -> str:
 
 def copy_entry(source: Path, destination: Path, *, hardlink: bool) -> None:
     if not source.exists():
-        print(f"[skip] missing {source.relative_to(ROOT)}")
-        return
+        raise SystemExit(f"Required portable file is missing: {source.relative_to(ROOT)}")
     if source.is_dir():
         shutil.copytree(
             source,
@@ -146,6 +116,46 @@ def copy_entry(source: Path, destination: Path, *, hardlink: bool) -> None:
             link_or_copy(str(source), str(destination))
         else:
             shutil.copy2(source, destination)
+
+
+def copy_git_tree(repository: Path, revision: str, destination: Path) -> None:
+    with tempfile.TemporaryFile() as archive:
+        subprocess.run(
+            ["git", "archive", "--format=zip", revision],
+            cwd=repository,
+            stdout=archive,
+            check=True,
+        )
+        with zipfile.ZipFile(archive) as source:
+            source.extractall(destination)
+
+
+def stage_release(stage: Path, *, hardlink: bool) -> None:
+    if not (ROOT / ENVIRONMENT / "python.exe").is_file():
+        raise SystemExit("Bundled Python is missing. Run pixi run install before packaging.")
+    upstream_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD:GPT-SoVITS"], cwd=ROOT, text=True
+    ).strip()
+    copy_git_tree(ROOT, "HEAD", stage)
+    copy_git_tree(ROOT / "GPT-SoVITS", upstream_commit, stage / "GPT-SoVITS")
+    copy_entry(ROOT / ENVIRONMENT, stage / ENVIRONMENT, hardlink=hardlink)
+
+    weights = {filename for files in BASE_MODEL_FILES.values() for filename in files}
+    weights.update({"chinese-hubert-base", "chinese-roberta-wwm-ext-large"})
+    for filename in sorted(weights):
+        source = PRETRAINED_DIR / filename
+        copy_entry(source, stage / source.relative_to(ROOT), hardlink=hardlink)
+    upstream_package = stage / "GPT-SoVITS" / "GPT_SoVITS"
+    copy_entry(
+        PRETRAINED_PACKAGE_DIR / "text" / "G2PWModel",
+        upstream_package / "text" / "G2PWModel",
+        hardlink=hardlink,
+    )
+    copy_entry(
+        PRETRAINED_DIR / "fast_langdetect",
+        upstream_package / "pretrained_models" / "fast_langdetect",
+        hardlink=hardlink,
+    )
 
 
 def write_portable_readme(stage: Path) -> None:
@@ -179,7 +189,10 @@ logs, generated audio, and temp files under `runtime\\`.
 
 - Windows portable release.
 - NVIDIA driver compatible with the bundled Torch/CUDA build is required for GPU inference.
-- Model files included in this package determine whether it can run fully offline.
+- Bundled official inference weights: v2, v2ProPlus, v4, v5turbo, v5dev.
+- Select a preset from the Admin's Model Presets tab.
+- Run `start_portable.bat models azurlane-v5turbo` to install Moear's optional
+  fine-tuned weights. See README.md for the available Azur Lane presets.
 """
     (stage / "PORTABLE_README.md").write_text(text, encoding="utf-8")
 
@@ -229,18 +242,22 @@ def run_archive(stage: Path, archive_dir: Path, *, volume: str, compression_leve
 
 def main() -> int:
     args = parse_args()
-    out_root = ensure_under_root(ROOT / args.out_dir, ROOT / ".codex-temp")
+    output_parent = ROOT / ".codex-temp"
+    out_root = ensure_under_root(ROOT / args.out_dir, output_parent)
+    if out_root == output_parent.resolve():
+        raise SystemExit("--out-dir must be inside .codex-temp.")
     stage_root = out_root / "stage"
     archive_root = out_root / "archive"
-    stage = stage_root / args.name
+    if not args.name or Path(args.name).name != args.name or args.name in {".", ".."}:
+        raise SystemExit("--name must be a single directory name.")
+    stage = ensure_under_root(stage_root / args.name, stage_root)
 
     if args.clean and out_root.exists():
         shutil.rmtree(out_root)
-    stage.mkdir(parents=True, exist_ok=True)
+    stage.mkdir(parents=True, exist_ok=False)
 
     hardlink = bool(args.hardlink and not args.copy)
-    for rel in COPY_PATHS:
-        copy_entry(ROOT / rel, stage / rel, hardlink=hardlink)
+    stage_release(stage, hardlink=hardlink)
     prepare_runtime_dirs(stage)
     write_portable_readme(stage)
 

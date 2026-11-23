@@ -6,6 +6,13 @@ from pathlib import Path
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 REPO_DIR = WORKSPACE_ROOT / "GPT-SoVITS"
+WINDOWS_ONNXRUNTIME = (
+    # Upstream's metadata-only wheel selects the CUDA 12 provider for Faster-Whisper and G2PW.
+    "onnxruntime @ https://huggingface.co/lj1995/GPT-SoVITS-windows-package/"
+    "resolve/c8b61d4f627d1f02e74c1ba158a4844051d2289f/wheels/cu128/onnxruntime-1.19.2-py3-none-any.whl"
+    "#sha256=ccec3c1e1f34ab0e0cfbc6d16b65c8482e1d26cb4d9645445f733341a56127c2"
+    " ; sys_platform == 'win32' and platform_machine == 'AMD64'"
+)
 
 
 def run(args: list[str]) -> None:
@@ -24,7 +31,12 @@ def main() -> None:
     if extra_req.exists():
         run([sys.executable, "-m", "pip", "install", "-r", str(extra_req), "--no-deps"])
     if requirements.exists():
-        run([sys.executable, "-m", "pip", "install", "-r", str(requirements)])
+        run([
+            sys.executable, "-m", "pip", "install", "-r", str(requirements),
+            "resampy>=0.4.2,<0.5", "setuptools>=80,<81",
+            "fast-langdetect>=0.3.1,<1", "x-transformers>=1.42,<2",
+            WINDOWS_ONNXRUNTIME,
+        ])
     run(
         [
             sys.executable,

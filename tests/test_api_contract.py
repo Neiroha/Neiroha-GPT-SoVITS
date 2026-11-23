@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -18,6 +19,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeRuntime:
+    repo_dir = ROOT / "GPT-SoVITS"
+
+    def synthesize_once(self, request, *, profile=None):
+        self.request = request
+        self.profile = profile
+        if not request["ref_audio_path"]:
+            raise FileNotFoundError("ref_audio_path is required.")
+        return 32000, launcher.np.zeros(320, dtype=launcher.np.int16)
+
     def status(self) -> dict[str, object]:
         return {
             "provider": "gpt-sovits",
@@ -47,6 +57,9 @@ class FakeRegistry:
         return []
 
     def list_profiles(self, model_id: str = "") -> list[object]:
+        return []
+
+    def list_model_presets(self) -> list[object]:
         return []
 
     def has_voice_set(self, model_id: str = "") -> bool:
@@ -102,6 +115,46 @@ class ApiContractBehaviorTest(unittest.TestCase):
         self.assertEqual(payload["error"]["code"], "unsupported_format")
         self.assertEqual(payload["error"]["message"], "response_format must be wav")
         self.assertEqual(payload["error"]["details"], {})
+
+    def test_default_model_can_resolve_a_named_voice_in_another_set(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            voice_sets = root / "sets"
+            voice_sets.mkdir()
+            (voice_sets / "default.toml").write_text('id = "default"\n', encoding="utf-8")
+            (voice_sets / "other.toml").write_text(
+                'id = "other"\nvoices = ["named-voice"]\n', encoding="utf-8",
+            )
+            (voice_sets / "explicit.toml").write_text('id = "explicit"\n', encoding="utf-8")
+            voice = root / "voices" / "named-voice"
+            voice.mkdir(parents=True)
+            launcher.write_toml_mapping(
+                voice / "voice.toml",
+                {
+                    "id": "named-voice",
+                    "model_preset": "v5turbo",
+                    "reference_audio": str(ROOT / "runtime/voices/genshin-keqing/reference.wav"),
+                    "prompt_text": "匹配参考音频的文字",
+                },
+            )
+            registry = launcher.VoiceRegistry(
+                root / "voices.json",
+                repo_dir=FakeRuntime.repo_dir,
+                voice_sets_dir=voice_sets,
+                runtime_voices_dir=voice.parent,
+            )
+            runtime = FakeRuntime()
+            client = TestClient(launcher.create_api_app(runtime, registry))
+            request = {"model": "default", "voice": "named-voice", "input": "测试", "response_format": "wav"}
+
+            response = client.post("/v1/audio/speech", json=request)
+            self.assertEqual(response.status_code, 200, response.text if response.status_code != 200 else "")
+            self.assertEqual(runtime.profile.model_preset, "v5turbo")
+            self.assertEqual(runtime.profile.voice_set_id, "other")
+            self.assertIsNone(runtime.request["sample_steps"])
+
+            response = client.post("/v1/audio/speech", json={**request, "model": "explicit"})
+            self.assertEqual(response.status_code, 404)
 
     def external_admin_ready_with_clone_route(self, clone_upload: str, *, fail_new_route: bool = False) -> bool:
         payload = json.dumps({"routes": {"clone_upload": clone_upload}}).encode("utf-8")

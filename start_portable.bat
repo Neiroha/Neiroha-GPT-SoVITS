@@ -38,6 +38,7 @@ if /I "%~1"=="api-admin" goto serve
 if /I "%~1"=="api" goto api
 if /I "%~1"=="admin" goto admin
 if /I "%~1"=="webui" goto webui
+if /I "%~1"=="models" goto models
 if /I "%~1"=="help" goto help
 if /I "%~1"=="--help" goto help
 
@@ -77,6 +78,14 @@ exit /b %ERRORLEVEL%
 "%PY%" "%ROOT%scripts\launch_gpt_sovits.py" --mode webui
 exit /b %ERRORLEVEL%
 
+:models
+if "%~2"=="" (
+    "%PY%" "%ROOT%scripts\download_assets.py" --help
+    exit /b 0
+)
+"%PY%" "%ROOT%scripts\download_assets.py" --skip-base-assets --models %2 %3 %4 %5 %6 %7 %8 %9
+exit /b %ERRORLEVEL%
+
 :help
 echo.
 call :say usage
@@ -85,6 +94,7 @@ call :say help_serve
 call :say help_api
 call :say help_admin
 call :say help_webui
+echo   start_portable.bat models ^<model-id^> [...]
 echo.
 call :say note
 exit /b 0
